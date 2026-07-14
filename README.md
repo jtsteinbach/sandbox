@@ -62,13 +62,13 @@ Requirements: Python 3.9+ (standard library only — no pip, no dependencies).
 **Install system-wide** (all users, requires sudo):
 
 ```bash
-curl -sL https://install.jts.gg/sandbox | sudo bash
+curl -sL install.jts.gg/sandbox | sudo bash
 ```
 
 **Install for your user only:**
 
 ```bash
-curl -sL https://install.jts.gg/sandbox | bash
+curl -sL install.jts.gg/sandbox | bash
 ```
 
 Then confirm it worked:
