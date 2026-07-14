@@ -1066,7 +1066,8 @@ def cmd_deploy(args):
         "label": args.label or "deploy", "author": f"{name} <{email}>"})
     print(f"{bold('deployed')} {amber(short(head))} {dim('as')} "
           f"{bold(args.label or 'deploy')}")
-    leaf(dim(f"journaled · chain head {link[:16]}…  (sb deploy --list)"))
+    leaf(dim("journaled · anchor ") + amber(link[:16])
+         + dim("  (sb deploy --list)"))
 
 def _verify(repo, quiet=False, anchor=None):
     """Full store verification. Returns True if everything checks out.
@@ -1143,14 +1144,21 @@ def _verify(repo, quiet=False, anchor=None):
             flag("refs", f"branch '{b}' exists in the journal but was "
                          f"removed from refs outside sb")
 
-    # 4. optional external anchor: does the chain contain this link?
+    # 4. optional external anchor: is this (prefix of a) link in the chain?
+    #    Anchors are 16-hex prefixes (64 bits) — short enough to jot down and
+    #    paste back, far too long for a forged entry to collide with.
     anchor_ok = False
     if anchor:
+        a = anchor.strip().lower().rstrip(".\u2026")   # forgive a pasted ellipsis
+        if not re.fullmatch(r"[0-9a-f]{8,64}", a):
+            die("an anchor is 8-64 hex characters (sb prints 16) — "
+                f"got {anchor!r}")
         links = {e["link"] for e in repo.journal_entries()}
-        if anchor in links or anchor == repo.meta("repo_id"):
+        links.add(repo.meta("repo_id"))
+        if any(l.startswith(a) for l in links):
             anchor_ok = True
         else:
-            flag("journal", f"anchor {anchor[:16]}… is NOT in the journal "
+            flag("journal", f"anchor {a[:16]} is NOT in the journal "
                             f"chain (history was replaced wholesale?)")
 
     if not quiet:
@@ -1164,11 +1172,12 @@ def _verify(repo, quiet=False, anchor=None):
                 "branch tips     " + (red("MISMATCH vs journal")
                 if "refs" in cats else "match the journal " + amber("\u2713"))]
         if anchor_ok:
-            rows.append("anchor          "
-                        + f"{amber(anchor[:16] + '…')} found " + amber("\u2713"))
+            rows.append("anchor check    "
+                        + amber(anchor.strip().lower()[:16]) + " found "
+                        + amber("\u2713"))
         if head_link:
-            rows.append("chain head      " + amber(head_link[:32] + "…")
-                        + dim("  (write it down — it anchors today's history)"))
+            rows.append("anchor          " + amber(head_link[:16])
+                        + dim("  (save it · check later: sb verify --anchor)"))
         tree_print(rows)
         for _, p in problems:
             print(red("  ! " + p))
@@ -1224,8 +1233,8 @@ def cmd_info(args):
         + dim(f"of {len(repo.branches())}"),
         f"objects  {counts.get('commit',0)} save(s) · "
         f"{counts.get('tree',0)} tree(s) · {counts.get('blob',0)} blob(s)",
-        f"journal  {n_journal} entries · chain head "
-        + cyan(repo.chain_head()[:16] + "…"),
+        f"journal  {n_journal} entries · anchor "
+        + amber(repo.chain_head()[:16]),
         f"you      {name} <{email}>  "
         + dim("(attribution only — no keys, no signatures)"),
     ])
@@ -1349,7 +1358,7 @@ def cmd_pack(args):
     size = out.stat().st_size
     print(f"{bold('packed')} {amber(out.name)} {dim('·')} {dim(f'{size:,} bytes')}")
     tree_print([
-        f"branch   {manifest['branch']} {dim('· chain head ' + manifest['chain_head'][:16] + '…')}",
+        f"branch   {manifest['branch']} {dim('· anchor')} {amber(manifest['chain_head'][:16])}",
         f"sealed   {name} <{email}>  "
         + dim(time.strftime('%Y-%m-%d %H:%M', time.localtime(manifest['created']))),
         dim("encrypted with vox · unpack: sb unpack "
@@ -1399,7 +1408,7 @@ def cmd_unpack(args):
     tree_print([
         f"sealed by  {who.get('name','?')} <{who.get('email','?')}>  {dim('· ' + when)}",
         f"branch     {manifest.get('branch','main')} "
-        + dim(f"· chain head {manifest.get('chain_head','')[:16]}…"),
+        + dim("· anchor ") + amber(manifest.get("chain_head","")[:16]),
         dim(f"verify it: cd {dest} && sb verify"),
     ])
 
@@ -1443,6 +1452,8 @@ HELP = f"""\
 {_row('info', 'stats and chain head')}
 {_row('who [name] [email]', 'how saves are attributed')}
 {_row('ignore <pattern>', 'add a .sbignore pattern', last=True)}
+
+  {dim('one SQLite store · SHA-256 verified · zero dependencies')}
 """
 
 def main(argv=None):
