@@ -250,16 +250,16 @@ The "is everything intact?" button. It:
 2. Validates every tree entry name (defense against crafted trees that try to escape the repository on checkout).
 3. Recomputes the **entire journal hash chain** from the repository ID to the head.
 4. Cross-checks every **branch tip against the journal's last record** of it — a ref moved outside sb is caught here.
-5. With `--anchor HEX`, additionally confirms that a previously noted chain link is still part of history (Section 9).
+5. With `--anchor HEX`, additionally confirms that a previously noted anchor is still part of history (Section 9). Anchors are 16-character prefixes of chain links; any 8–64 hex characters are accepted.
 
-Prints a category-by-category report and the current **chain head** — write that value down somewhere else and it becomes an anchor. Exits `0` when everything agrees, `2` with a precise list of problems otherwise.
+Prints a category-by-category report and the current **anchor** — a 16-character value you can copy somewhere off-machine and paste back later. Exits `0` when everything agrees, `2` with a precise list of problems otherwise.
 
 ```
 checked 18 objects across 5 save(s)
   ├─── content hashes  all valid ✓
   ├─── journal chain   11 entries linked ✓
   ├─── branch tips     match the journal ✓
-  └─── chain head      8977ecba8bd79985…  (write it down — it anchors today's history)
+  └─── anchor          8977ecba8bd79985  (save it · check later: sb verify --anchor)
 history is intact ✓ — store, journal and refs all agree
 ```
 
@@ -269,7 +269,7 @@ The append-only operation log: every save, merge, undo, branch, switch, and depl
 
 ### `sb info`
 
-One-screen repository overview: store location and size, current branch, object counts, journal length, chain head, and how your saves will be attributed.
+One-screen repository overview: store location and size, current branch, object counts, journal length, the current anchor, and how your saves will be attributed.
 
 ### `sb who [name] [email]`
 
@@ -426,17 +426,19 @@ The previous design signed every commit with Ed25519, falling back to a hand-rol
 
 The one attack a keyless store cannot detect internally is wholesale rewrite (Promise 2's stated limit). Anchors close it with nothing but a hash and a second location.
 
-Every `sb verify` (and `sb info`) prints the current **chain head** — the link of the latest journal entry:
+Every `sb verify` (and `sb info`) prints the current **anchor** — a copy-paste-ready 16-character prefix of the latest journal entry's chain link:
 
 ```
-  └─── chain head      67b3dea8b260c12a0b292f1bd30cb0f1…  (write it down — it anchors today's history)
+  └─── anchor          67b3dea8b260c12a  (save it · check later: sb verify --anchor)
 ```
 
-Record that value anywhere outside the machine: a note on your phone, a message to a colleague, a printed line in a logbook, a weekly entry in a password manager. Later:
+Copy that value anywhere outside the machine: a note on your phone, a message to a colleague, a printed line in a logbook, a weekly entry in a password manager. Later, paste it straight back:
 
 ```bash
-sb verify --anchor 67b3dea8b260c12a0b292f1bd30cb0f1...
+sb verify --anchor 67b3dea8b260c12a
 ```
+
+Sixteen hex characters is 64 bits — trivially short to jot down, yet computationally infeasible for a forged journal entry to collide with. Any 8–64 hex prefix of a chain link is accepted (a stray pasted `…` is forgiven), so a full 64-character link recorded by an older habit still works.
 
 If the anchor is a link in the current chain, everything up to that moment is exactly as it was when you noted it — every operation, every save those operations recorded. If it is **not** found, the journal you noted is not the journal on disk: history was replaced wholesale, and no internally consistent rewrite can hide it, because the attacker cannot alter what's written in your notebook.
 
@@ -455,9 +457,9 @@ sb pack "my-strong-pass-key" release.sbox # choose the output name
 
 ```
 packed my-project.sbox · 45,576 bytes
-  ├─── branch   main · chain head bd40a7878f681649…
+  ├─── branch   main · anchor bd40a7878f681649
   ├─── sealed   Jordan <jt@noct.gg>  2026-07-14 08:35
-  └─── encrypted with vox (jts.gg/vox) · unpack: sb unpack my-project.sbox <PASS-KEY>
+  └─── encrypted with vox · unpack: sb unpack my-project.sbox <PASS-KEY>
 ```
 
 To restore it — on any machine with sb and network access — give the file and the same pass-key:
@@ -470,7 +472,7 @@ sb unpack my-project.sbox "my-strong-pass-key" dest-dir   # choose the folder
 ```
 unpacked my-project · 3 file(s)
   ├─── sealed by  Jordan <jt@noct.gg>  · 2026-07-14 08:35
-  ├─── branch     main · chain head bd40a7878f681649…
+  ├─── branch     main · anchor bd40a7878f681649
   └─── verify it: cd my-project && sb verify
 ```
 
@@ -566,7 +568,7 @@ Two behaviors worth knowing: ignoring a pattern does not remove already-saved fi
 
 **Release with a paper trail.** Keep the real test suite at `sb-tests/pre-deploy/`. Ship with `sb deploy v1.4`: sb verifies the entire store, runs the suite against a clean checkout of exactly what's shipping, and journals the record. `sb deploy --list` is your release history, protected by the chain.
 
-**Weekly trust ritual.** `sb verify`, note the chain head next to the date somewhere off-machine. Thirty seconds; afterward, no rewrite of any history before that moment can escape `sb verify --anchor`.
+**Weekly trust ritual.** `sb verify`, copy the 16-character anchor next to the date somewhere off-machine. Thirty seconds; afterward, no rewrite of any history before that moment can escape `sb verify --anchor`.
 
 **Two branches touched the same file.** Merge anyway — if the edits don't overlap line-wise, sb combines them automatically and tells you (`1 file(s) auto-merged`). If they truly overlap, sb stops *before touching anything*, names the files and reasons, and your working folder is untouched. Reconcile on one branch, save, merge again.
 
@@ -683,7 +685,7 @@ Stated plainly, because a tool that hides its edges isn't trustworthy:
 - **Whole-file storage.** zlib-compressed but not delta-compressed; fine for code and documents, heavy for huge frequently-changing binaries.
 - **Conservative merges.** Adjacent-line edits and same-point insertions conflict rather than merge; and conflicts are resolved by reconciling on a branch, not via in-worktree conflict markers with a merge-in-progress state (an explicit simplicity trade — sb never leaves your worktree in a special mode).
 - **No branch rename/delete, no per-save tags** yet.
-- **Anchors are manual.** Automatic anchoring (e.g., appending each chain head to a file on another volume) is roadmap.
+- **Anchors are manual.** Automatic anchoring (e.g., appending each anchor to a file on another volume) is roadmap.
 - **Single-writer.** Concurrent sb invocations are safe but serialized.
 
 ---
