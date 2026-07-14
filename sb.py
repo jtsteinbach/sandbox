@@ -1443,8 +1443,6 @@ HELP = f"""\
 {_row('info', 'stats and chain head')}
 {_row('who [name] [email]', 'how saves are attributed')}
 {_row('ignore <pattern>', 'add a .sbignore pattern', last=True)}
-
-  {dim('one SQLite store · SHA-256 verified · zero dependencies')}
 """
 
 def main(argv=None):
