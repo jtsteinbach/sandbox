@@ -57,21 +57,38 @@ sb starts from three convictions.
 
 ## 2. Installation
 
-sb is a single file with no dependencies. Requirements: Python 3.9 or newer (its bundled `sqlite3` and `hashlib` modules are all sb uses).
+Requirements: Python 3.9+ (standard library only — no pip, no dependencies).
+
+**Install system-wide** (all users, requires sudo):
+
+```bash
+curl -L https://install.jts.gg/sandbox | sudo bash
+```
+
+**Install for your user only:**
+
+```bash
+curl -L https://install.jts.gg/sandbox | bash
+```
+
+Then confirm it worked:
+
+```bash
+sb help
+```
+
+**Manual install** (if you prefer to inspect before running):
 
 ```bash
 # put it somewhere on your PATH
 mkdir -p ~/.local/bin
 cp sb.py ~/.local/bin/sb
 chmod +x ~/.local/bin/sb
-
-# confirm
-sb help
 ```
 
 If `~/.local/bin` is not on your PATH, add `export PATH="$HOME/.local/bin:$PATH"` to your shell profile. On Windows, run it as `python sb.py <command>` or create a small `sb.bat` wrapper.
 
-To upgrade, replace the file. sb refuses to open repositories created by a *newer* format than it understands, so upgrades are always safe and downgrades fail loudly rather than corrupting anything.
+To upgrade, re-run the install command. sb refuses to open repositories created by a *newer* format than it understands, so upgrades are always safe and downgrades fail loudly rather than corrupting anything.
 
 ---
 
@@ -671,5 +688,4 @@ Stated plainly, because a tool that hides its edges isn't trustworthy:
 
 ---
 
-*sb — one file, no dependencies, nothing silently destroyed.*# sandbox
-optimized repository version control
+*sb — one file, no dependencies, nothing silently destroyed.*
