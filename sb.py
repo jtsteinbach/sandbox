@@ -545,7 +545,7 @@ def ensure_clean(repo):
     a, m, d = worktree_vs_tree(work, tree)
     if a or m or d:
         die("you have unsaved changes — run 'sb save' first (nothing is ever\n"
-            "       silently discarded), or 'sb restore <path>' to drop them")
+            "       silently discarded), or 'sb undo -p <path>' to drop them")
 
 # ------------------------------------------------------- three-way merge ----
 def _diff_regions(base, side):
@@ -837,27 +837,29 @@ def cmd_diff(args):
             else:
                 print(line)
 
-def cmd_restore(args):
-    repo = need_repo()
-    tree, _ = head_tree_files(repo)
-    rel = args.path.rstrip("/")
-    matches = [rel] if rel in tree else \
-              [p for p in tree if p.startswith(rel + "/")]
-    if not matches:
-        die(f"'{rel}' is not in the last save")
-    for m in matches:
-        mode, h = tree[m]
-        p = repo.root / m
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_bytes(repo.get(h)[1])
-        os.chmod(p, 0o755 if mode == "100755" else 0o644)
-    what = cyan(rel) if len(matches) == 1 else f"{len(matches)} file(s) under {rel}/"
-    print(f"restored {what} from last save")
-
 def cmd_undo(args):
-    """Non-destructive undo: a NEW save whose content equals the previous
-    save. History is never rewritten; run undo again to redo."""
+    """Non-destructive undo. Plain: a NEW save whose content equals the
+    previous save (history is never rewritten; run undo again to redo).
+    With -p <path>: bring just that file or folder back from the last
+    save, overwriting the working copy — no new save is created."""
     repo = need_repo()
+    if args.path:                       # targeted: un-mangle one path
+        tree, _ = head_tree_files(repo)
+        rel = args.path.rstrip("/")
+        matches = [rel] if rel in tree else \
+                  [p for p in tree if p.startswith(rel + "/")]
+        if not matches:
+            die(f"'{rel}' is not in the last save")
+        for m in matches:
+            mode, h = tree[m]
+            p = repo.root / m
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(repo.get(h)[1])
+            os.chmod(p, 0o755 if mode == "100755" else 0o644)
+        what = cyan(rel) if len(matches) == 1 else \
+            f"{len(matches)} file(s) under {rel}/"
+        print(f"brought back {what} from the last save")
+        return
     head = repo.head_commit()
     if not head:
         die("nothing to undo")
@@ -874,6 +876,102 @@ def cmd_undo(args):
     print(f"{bold('undone')} {dim('— created')} {amber(short(h))}")
     leaf(f'reverts "{msg}"  '
          + dim("(history preserved; sb undo again to redo)"))
+
+def _journal_tips_at(repo, seq):
+    """Branch tips exactly as the journal recorded them just after entry
+    `seq`: {branch: commit_hash}. This is what makes anchors addressable —
+    an anchor names a journal moment, and this replays the world to it."""
+    tips = {}
+    for e in repo.journal_entries():
+        if e["seq"] > seq:
+            break
+        op, d = e["op"], e["detail"]
+        if op in ("save", "merge", "undo", "branch", "ref", "restore"):
+            tips[d["branch"]] = d["new"]
+        elif op == "branch-remove":
+            tips.pop(d["branch"], None)
+    return tips
+
+def _resolve_restore(repo, what):
+    """Resolve a restore target — journal anchor, save-hash prefix, deploy
+    label, or branch — to (commit_hash, how). Anchors resolve to the
+    CURRENT branch's tip as of that journal moment."""
+    hits = []
+    recs = [e for e in repo.journal_entries()
+            if e["op"] == "deploy" and e["detail"].get("label") == what]
+    if recs:
+        hits.append((recs[-1]["detail"]["commit"], f"deploy '{what}'"))
+    if what in repo.branches():
+        t = repo.tip(what)
+        if t:
+            hits.append((t, f"branch '{what}'"))
+    w = (what or "").strip().lower().rstrip(".\u2026")
+    if re.fullmatch(r"[0-9a-f]{4,64}", w):
+        rows = repo.db.execute(
+            "SELECT hash FROM objects WHERE kind='commit' AND hash LIKE ?",
+            (w + "%",)).fetchall()
+        if len(rows) > 1:
+            die(f"'{what}' matches {len(rows)} saves — give more characters")
+        if len(rows) == 1:
+            hits.append((rows[0][0], "save " + short(rows[0][0])))
+        if len(w) >= 8:                    # anchors are 8-64 hex (sb prints 16)
+            marks = [e for e in repo.journal_entries()
+                     if e["link"].startswith(w)]
+            if len(marks) > 1:
+                die(f"'{what}' matches {len(marks)} journal entries — "
+                    f"give more characters")
+            if marks:
+                e = marks[0]
+                when = time.strftime("%Y-%m-%d %H:%M", time.localtime(e["ts"]))
+                branch = repo.current_branch()
+                tip = _journal_tips_at(repo, e["seq"]).get(branch)
+                if not tip:
+                    existed = sorted(b for b, t in
+                                     _journal_tips_at(repo, e["seq"]).items() if t)
+                    die(f"at anchor {w[:16]} ({when}) branch '{branch}' had no "
+                        f"saves yet" + (f"\n       branches with saves then: "
+                                        f"{', '.join(existed)}" if existed else ""))
+                hits.append((tip, f"anchor {w[:16]} ({when}, {branch})"))
+    seen, uniq = set(), []                 # one name can match twice; same
+    for h, how in hits:                    # commit found two ways is fine
+        if h not in seen:
+            seen.add(h); uniq.append((h, how))
+    if not uniq:
+        hint = ""
+        if "/" in (what or "") or (repo.root / (what or "")).exists():
+            hint = (f"\n       to bring a file back from the last save: "
+                    f"sb undo -p {what}")
+        die(f"nothing named '{what}' — not an anchor, save hash, deploy "
+            f"label, or branch\n       (anchors: sb journal · saves: sb log · "
+            f"labels: sb deploy -l)" + hint)
+    if len(uniq) > 1:
+        die(f"'{what}' is ambiguous — it matches "
+            + " and ".join(how for _, how in uniq)
+            + "\n       give more characters or use the full form")
+    return uniq[0]
+
+def cmd_restore(args):
+    """Non-destructive time travel: a NEW save whose content equals the
+    chosen past state. Like undo, but to any point — nothing is rewound,
+    nothing is deleted, and sb undo immediately after returns you."""
+    repo = need_repo()
+    head = repo.head_commit()
+    if not head:
+        die("no saves yet — nothing to restore")
+    ensure_clean(repo)
+    commit_hash, how = _resolve_restore(repo, args.target)
+    c = parse_commit(repo, commit_hash)
+    if commit_hash == head or c["tree"] == parse_commit(repo, head)["tree"]:
+        print(green("already at that state — nothing to do"))
+        return
+    target_tree = read_tree(repo, c["tree"])     # every blob re-hash-verified
+    cur_tree, _ = head_tree_files(repo)
+    checkout_tree(repo, target_tree, cur_tree)
+    h = make_commit(repo, c["tree"], [head], f"restore: to {how}")
+    repo.update_ref(repo.current_branch(), h, op="restore")
+    print(f"{bold('restored')} {dim('to')} {how} {dim('— created')} "
+          f"{amber(short(h))}")
+    leaf(dim("history preserved — nothing deleted; sb undo returns you"))
 
 def cmd_branch(args):
     repo = need_repo()
@@ -1188,7 +1286,7 @@ def _verify(repo, quiet=False, anchor=None):
     #    edited behind sb's back (e.g. direct SQL) is caught here
     expected = {}
     for e in repo.journal_entries():
-        if e["op"] in ("save", "merge", "undo", "branch", "ref"):
+        if e["op"] in ("save", "merge", "undo", "restore", "branch", "ref"):
             d = e["detail"]
             expected[d["branch"]] = d["new"]
         elif e["op"] == "branch-remove":
@@ -1264,7 +1362,7 @@ def cmd_journal(args):
     for e in entries:
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(e["ts"]))
         d = e["detail"]
-        if e["op"] in ("save", "merge", "undo", "branch", "ref"):
+        if e["op"] in ("save", "merge", "undo", "restore", "branch", "ref"):
             what = f"{d.get('branch','')}: {short(d.get('old',''))} → {short(d.get('new',''))}"
         elif e["op"] == "switch":
             what = f"to {d.get('to','')}"
@@ -1930,7 +2028,8 @@ USAGES = {
     "sb save":    'sb save "<message>" [--allow-secrets] [--no-verify]',
     "sb log":     "sb log [-n <count>]",
     "sb diff":    "sb diff [<path>]",
-    "sb restore": "sb restore <path>",
+    "sb restore": "sb restore <anchor | save | deploy-label | branch>",
+    "sb undo":    "sb undo [-p <path>]",
     "sb branch":  "sb branch [<name>] [-r]",
     "sb switch":  "sb switch <branch>",
     "sb merge":   "sb merge <branch> [--no-verify]",
@@ -2004,7 +2103,8 @@ HELP = f"""
 {_opt('-n, --limit <count>', 'show only the newest <count> saves')}
 {_row('diff [<path>]', 'line-by-line changes, all files or one path')}
 {_row('undo', 'revert the last save, keeping history')}
-{_row('restore <path>', 'bring a file or folder back', last=True)}
+{_opt('-p, --path <path>', 'bring back just one file or folder instead')}
+{_row('restore <version>', 'return to any past anchor, save, or deploy', last=True)}
 
 {amber('branches')}
 {_row('branch [<name>]', 'list branches, or create one named <name>')}
@@ -2065,8 +2165,8 @@ def main(argv=None):
         lp = sub.add_parser("log")
         lp.add_argument("-n", "--limit", type=int, default=0, metavar="<count>")
         dp = sub.add_parser("diff"); dp.add_argument("path", nargs="?")
-        sub.add_parser("undo")
-        rp = sub.add_parser("restore"); rp.add_argument("path")
+        up = sub.add_parser("undo"); up.add_argument("-p", "--path", metavar="<path>")
+        rp = sub.add_parser("restore"); rp.add_argument("target")
         bp = sub.add_parser("branch"); bp.add_argument("name", nargs="?")
         bp.add_argument("-r", "--remove", action="store_true")
         wp = sub.add_parser("switch"); wp.add_argument("target")
