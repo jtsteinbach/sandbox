@@ -1,6 +1,6 @@
 # sandbox (sb)
 
-**Version 1.0** · [jts.gg/sandbox](https://jts.gg/sandbox)
+**Version 1.1** · [jts.gg/sandbox](https://jts.gg/sandbox)
 **License** · [jts.gg/license](https://jts.gg/license)
 
 **Safe, honest version control for humans.** One file. One command vocabulary you can learn in five minutes. Zero dependencies beyond Python 3.9+. Zero cryptography libraries. Nothing is ever silently destroyed.
@@ -148,7 +148,7 @@ Every object is **re-hashed on every read**. Silent corruption cannot flow into 
 
 ### The journal
 
-The **journal** is sb's signature idea: an append-only log inside the store where every operation that changes anything — every save, merge, undo, branch creation, switch, and deploy — is recorded. Each entry embeds the SHA-256 link of the previous entry, forming a **hash chain** rooted in a random repository ID chosen at `init`.
+The **journal** is sb's signature idea: an append-only log inside the store where every operation that changes anything — every save, merge, undo, restore, branch creation, switch, and deploy — is recorded. Each entry embeds the SHA-256 link of the previous entry, forming a **hash chain** rooted in a random repository ID chosen at `init`.
 
 This makes the repository's *operational history* tamper-evident, not just its content:
 
@@ -184,7 +184,7 @@ Creates a repository in the current folder: the `.sb/` directory containing `san
 
 ### `sb status`
 
-Shows the current branch, the latest save, and every file that is `new`, `modified`, or `deleted` relative to that save. Fast even on large trees thanks to the stat cache (Section 11): unchanged files are detected by size + modification time without being re-read.
+Shows the current branch, the latest save, and every file that is `new`, `modified`, or `deleted` relative to that save. Fast even on large trees thanks to the stat cache (Section 11): unchanged files are detected by their stat metadata without being re-read.
 
 ### `sb save "<message>" [--allow-secrets] [--no-verify]`
 
@@ -226,11 +226,11 @@ Ambiguous targets (a prefix matching several saves, or a name matching two diffe
 
 With no argument, lists branches, marking the current one and showing each tip. With a name, creates a branch pointing at the current save. Branch names must be single path components (no `/`, no leading `-`).
 
-With `-r` (long: `--remove`), deletes the named branch's *pointer* — never the current branch, and never the last one. The saves it pointed at stay in the object store and the journal untouched (removal is itself a journaled operation, so a branch deleted behind sb's back via direct SQL is still flagged by `verify`).
+With `-r` (long: `--remove`), deletes the named branch's *pointer* — never the current branch, and never the last one. The saves it pointed at stay in the object store and the journal untouched, and `verify` keeps re-checking them (removal is itself a journaled operation, so a branch deleted behind sb's back via direct SQL is still flagged by `verify`).
 
 ### `sb switch <branch>`
 
-Moves to a branch: rewrites the working folder to match its latest save and updates the current-branch pointer. **Refuses to run with unsaved changes** — save first, or `restore` the files you want to drop. File writes during switch are atomic (write-to-temp, then rename), and directories emptied by the switch are pruned.
+Moves to a branch: rewrites the working folder to match its latest save and updates the current-branch pointer. **Refuses to run with unsaved changes** — save first, or `sb undo -p` the files you want to drop. File writes during switch are atomic (write-to-temp, then rename), and directories emptied by the switch are pruned.
 
 ### `sb merge <branch> [--no-verify]`
 
@@ -270,7 +270,7 @@ With `-k <passkey>`, it instead produces an encrypted, files-only `.sbox` releas
 
 The "is everything intact?" button. It:
 
-1. Walks every save reachable from every branch and **re-hashes every commit, tree, and blob**.
+1. **Re-hashes every object in the store** — every commit, tree, and blob, including history kept from removed branches and objects left by an interrupted operation. Nothing stored escapes the check.
 2. Validates every tree entry name (defense against crafted trees that try to escape the repository on checkout).
 3. Recomputes the **entire journal hash chain** from the repository ID to the head.
 4. Cross-checks every **branch tip against the journal's last record** of it — a ref moved outside sb is caught here.
@@ -289,7 +289,7 @@ history is intact ✓ — store, journal and refs all agree
 
 ### `sb journal [-n <count>]`
 
-The append-only operation log: every save, merge, undo, branch, switch, and deploy, each with its timestamp, detail, and chain link. Ends by re-verifying the chain and telling you so. This is the answer to "what actually happened in this repository?" — including things `log` doesn't show, like switches and deploys.
+The append-only operation log: every save, merge, undo, restore, branch, switch, and deploy, each with its timestamp, detail, and chain link. Ends by re-verifying the chain and telling you so. This is the answer to "what actually happened in this repository?" — including things `log` doesn't show, like switches and deploys.
 
 ### `sb info`
 
@@ -319,7 +319,7 @@ With `-f` (long: `--files-only`), writes only the native files — no `.sb` dire
 
 ### `sb version`
 
-`sb version` (also `-V` / `--version`) prints the version and author: `sb 1.0 · jts.gg/sandbox`.
+`sb version` (also `-V` / `--version`) prints the version and author: `sb 1.1 · jts.gg/sandbox`.
 
 ---
 
@@ -418,7 +418,7 @@ sb makes exactly three promises. Each is stated with its mechanism, what it defe
 
 ### Promise 1 — Integrity: *what you get back is what you put in*
 
-**Mechanism.** Every object is stored under the SHA-256 hash of its content, and re-hashed on **every read**, not just during `verify`. Every save embeds its tree hash and parent hashes, so each save transitively fixes the exact bytes of every file in it and every save before it. All writes are atomic SQLite transactions (WAL mode); working-folder writes during switch/merge use write-to-temp-then-rename.
+**Mechanism.** Every object is stored under the SHA-256 hash of its content, and re-hashed on **every read**, not just during `verify`. Every save embeds its tree hash and parent hashes, so each save transitively fixes the exact bytes of every file in it and every save before it. Every operation commits as **one SQLite transaction** (WAL mode): a save's objects, branch move, and journal entry land together or not at all. Working-folder writes use write-to-temp-then-rename; the working folder and the database cannot share a transaction, so a crash between them surfaces as ordinary unsaved changes in `status` — never as corruption or a false tamper report.
 
 **Defends against:** disk corruption, torn writes, power loss mid-operation, truncated or bit-flipped objects, a crafted tree object attempting path traversal on checkout (entry names are validated to be single, safe path components).
 
@@ -547,7 +547,7 @@ vox provides a misuse-resistant authenticated cipher (an SIV-style AEAD built on
 
 The entire repository is **one SQLite database**: `.sb/sandbox.db`, in WAL mode, created `0600`. This is a deliberate rejection of git's loose-object layout, for reasons that compound:
 
-- **Crash safety.** Every sb operation — blobs, tree, commit, ref move, journal entry — is a single ACID transaction. Git's loose files and separately-written refs can tear under power loss; SQLite's journal cannot. (Precedent: Fossil, the VCS written by SQLite's own author, made the same bet fifteen years ago.)
+- **Crash safety.** Every sb operation — blobs, tree, commit, ref move, journal entry — commits as a single ACID transaction: all of it lands, or none of it does. Git's loose files and separately-written refs can tear under power loss; SQLite's journal cannot. (Precedent: Fossil, the VCS written by SQLite's own author, made the same bet fifteen years ago.)
 - **No small-file sprawl.** A large git repo holds hundreds of thousands of tiny objects, punishing filesystems and backup tools. sb is one file: `cp` is a valid backup, `rsync` sees one changed file, and there is nothing to "pack."
 - **Real queries.** Prefix resolution is an indexed `LIKE`, statistics are one `GROUP BY`, and the stat cache is a table — no ad-hoc index file with its own format and lock protocol.
 - **Auditable by anything.** The format is inspectable with the world's most widely deployed database tooling, not a bespoke binary format.
@@ -560,7 +560,7 @@ The entire repository is **one SQLite database**: `.sb/sandbox.db`, in WAL mode,
 | `objects` | `hash → kind, size, zlib(data)` — the content-addressed store |
 | `refs` | `name → commit hash` — branch tips (empty string = branch with no saves) |
 | `journal` | `seq, ts, op, detail(JSON), prev, link` — the append-only hash chain |
-| `statcache` | `path → size, mtime_ns, hash` — change detection without re-reading |
+| `statcache` | `path → size, mtime, ctime, inode, hash` — change detection without re-reading |
 
 ### Object encodings
 
@@ -568,7 +568,7 @@ An object's hash is `SHA-256("<kind> <length>\0" + data)`. Trees and commits are
 
 ### The stat cache
 
-`status` and `save` detect changes by comparing each file's size and nanosecond mtime against the cache; on a match, the previous hash is reused and the file is never read. Two safety valves keep this honest: files modified within the last two seconds are always re-read (defeating the classic "same-size edit within mtime granularity" race), and during a saving pass a cached hash is only trusted if the blob actually exists in the store. On a ~400-file tree, warm `status` completes in under 100 ms.
+`status` and `save` detect changes by comparing each file's size, mtime, **ctime, and inode** against the cache; on a full match, the previous hash is reused and the file is never read. mtime alone can be forged or restored (`touch -d`, archive extraction, build tools), but ctime is kernel-maintained and the inode changes when an editor replaces a file — so a same-size edit with a restored mtime still misses the cache and gets re-read. Files touched within the last two seconds always bypass the cache, and during a save a cached hash is only trusted if the blob actually exists in the store. A cache miss only costs a re-read — the cache fails toward correctness, never away from it. On a ~400-file tree, warm `status` completes in under 100 ms.
 
 ### What checkout guarantees
 
@@ -707,7 +707,7 @@ SQLite serializes writers, so concurrent sb commands won't corrupt anything; a s
 No. No network code exists in sb — no telemetry, no phoning home, nothing.
 
 **Can I rename a branch or delete one?**
-Delete, yes: `sb branch <name> -r` removes the branch's pointer (journaled, never the current or last branch — its saves stay in history). Rename is not built in yet; today it's create-at-the-same-save + remove: `sb branch new-name && sb branch old-name -r` (from another branch).
+Delete, yes: `sb branch <name> -r` removes the branch's pointer (journaled, never the current or last branch — its saves stay in history and `verify` keeps checking them). Rename is not built in yet; today it's create-at-the-same-save + remove: `sb branch new-name && sb branch old-name -r` (from another branch).
 
 **Can `unpack -i` be undone?**
 No — `-i` overwrites files in place, with no per-file backup. Files the archive replaces are gone (files it doesn't ship are untouched). That's why the flag exists at all: without it, unpack refuses any non-empty destination, so overwriting is always a decision you typed, never an accident. If the destination folder matters, back it up (or make it an sb repo and save) before merging into it.
