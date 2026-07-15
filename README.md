@@ -2,15 +2,25 @@
 
 **Version 1.0** · [jts.gg/sandbox](https://jts.gg/sandbox)
 
-**Safe and light version control.** One file. One command vocabulary you can learn in five minutes. Zero dependencies beyond Python 3.9+. Zero cryptography libraries. Nothing is ever silently destroyed.
+**Safe, honest version control for humans.** One file. One command vocabulary you can learn in five minutes. Zero dependencies beyond Python 3.9+. Zero cryptography libraries. Nothing is ever silently destroyed.
 
 sb is not a git clone and does not use git's repository format. It keeps the two ideas git got right — content addressing and a Merkle DAG of snapshots — and replaces everything that makes git hostile to daily use: the staging area, detached HEADs, destructive commands, a repository made of thousands of fragile loose files, and error messages written for git's own developers.
 
+```
+$ sb init
+$ sb save "first version of the landing page"
+saved 8163c18fe1 on main · 12 file(s)
+  └─── "first version of the landing page"
+```
+
+That is the entire mental model: **you work, you save.** Everything else — branches, merges, quality gates, deployment records, tamper detection — builds on those two verbs.
+
+---
 
 ## Table of contents
 
-1. [Installation](#1-installation)
-2. [Why sandbox exists](#2-why-sb-exists)
+1. [Why sb exists](#1-why-sb-exists)
+2. [Installation](#2-installation)
 3. [Five-minute quickstart](#3-five-minute-quickstart)
 4. [Core concepts](#4-core-concepts)
 5. [Command reference](#5-command-reference)
@@ -31,20 +41,34 @@ sb is not a git clone and does not use git's repository format. It keeps the two
 
 ---
 
-## 1. Installation
+## 1. Why sb exists
+
+Version control solves a real problem: *"I want to change things without fear, and know exactly what happened later."* Git solves that problem too — wrapped in an interface where `checkout` means four different things, where a mistyped `reset --hard` erases an afternoon of work, and where the repository itself is a directory of thousands of loose files that a power cut can leave half-written.
+
+sb starts from three convictions.
+
+**Safety should be structural, not disciplinary.** In sb there is no command that discards saved history. `undo` creates *new* history that reverts the old. `switch` refuses to run over unsaved work. The store is one SQLite database, so every operation is a single atomic transaction — a crash mid-save leaves you exactly where you were, never in a torn in-between state.
+
+**A tool can be simple without being a toy.** sb has no staging area (a save snapshots everything that isn't ignored), no detached HEAD (you are always on a branch), and no rebase (history is append-only). Yet it has real branches, real three-way merges with automatic conflict-free merging, versioned test gates that block bad saves, deployment records, and a full-store integrity verifier.
+
+**Security features should be honest.** sb makes exactly three security promises — integrity, tamper evidence, and leak prevention — and Section 8 states precisely how each is achieved, what it defends against, and what it deliberately does not. There are no keys to lose, no signatures to misunderstand, and no cryptography library in the dependency tree. Everything rests on one primitive: SHA-256 from Python's standard library, used for content addressing and hash chaining.
+
+---
+
+## 2. Installation
 
 Requirements: Python 3.9+ (standard library only — no pip, no dependencies).
 
 **Install system-wide** (all users, requires sudo):
 
 ```bash
-curl -sL install.jts.gg/sandbox | sudo bash
+curl -L https://install.jts.gg/sandbox | sudo bash
 ```
 
 **Install for your user only:**
 
 ```bash
-curl -sL install.jts.gg/sandbox | bash
+curl -L https://install.jts.gg/sandbox | bash
 ```
 
 Then confirm it worked:
@@ -65,20 +89,6 @@ chmod +x ~/.local/bin/sb
 If `~/.local/bin` is not on your PATH, add `export PATH="$HOME/.local/bin:$PATH"` to your shell profile. On Windows, run it as `python sb.py <command>` or create a small `sb.bat` wrapper.
 
 To upgrade, re-run the install command. sb refuses to open repositories created by a *newer* format than it understands, so upgrades are always safe and downgrades fail loudly rather than corrupting anything.
-
----
-
-## 2. Why sb exists
-
-Version control solves a real problem: *"I want to change things without fear, and know exactly what happened later."* Git solves that problem too — wrapped in an interface where `checkout` means four different things, where a mistyped `reset --hard` erases an afternoon of work, and where the repository itself is a directory of thousands of loose files that a power cut can leave half-written.
-
-sb starts from three convictions.
-
-**Safety should be structural, not disciplinary.** In sb there is no command that discards saved history. `undo` creates *new* history that reverts the old. `switch` refuses to run over unsaved work. The store is one SQLite database, so every operation is a single atomic transaction — a crash mid-save leaves you exactly where you were, never in a torn in-between state.
-
-**A tool can be simple without being a toy.** sb has no staging area (a save snapshots everything that isn't ignored), no detached HEAD (you are always on a branch), and no rebase (history is append-only). Yet it has real branches, real three-way merges with automatic conflict-free merging, versioned test gates that block bad saves, deployment records, and a full-store integrity verifier.
-
-**Security features should be honest.** sb makes exactly three security promises — integrity, tamper evidence, and leak prevention — and Section 8 states precisely how each is achieved, what it defends against, and what it deliberately does not. There are no keys to lose, no signatures to misunderstand, and no cryptography library in the dependency tree. Everything rests on one primitive: SHA-256 from Python's standard library, used for content addressing and hash chaining.
 
 ---
 
@@ -104,7 +114,8 @@ sb merge idea                    # 3-way merge; non-overlapping edits merge them
 
 # oops
 sb undo                          # reverts the last save — as a NEW save
-sb restore src/app.py            # bring one file back from the last save
+sb undo -p src/app.py            # bring one file back from the last save
+sb restore 67b3dea8b260c12a      # return to any past anchor, save, or deploy
 
 # trust, but verify
 sb verify                        # re-hash every object, check the journal chain
@@ -200,13 +211,24 @@ Save history for the current branch, newest first: hash, date, author, message, 
 
 Unified, colorized diff between the working folder and the last save. With `<path>`, limits output to that file or everything under that folder. Binary files show as changed in `status` but are not rendered as text diffs.
 
-### `sb undo`
+### `sb undo [-p <path>]`
 
 Reverts the effect of the latest save **by creating a new save** whose content equals the previous one. History is never rewritten and nothing is deleted — the "undone" save remains fully in the log and journal. Running `sb undo` again redoes (it reverts the revert). Requires a clean working tree, so it can never eat uncommitted work.
 
-### `sb restore <path>`
+With `-p <path>` (long: `--path`), it instead brings just that file — or everything under that folder — back from the last save, overwriting the working copy with the saved version and its permissions. This is the "I mangled this file, give me back the good one" move; no new save is created, since only your uncommitted working copy changes.
 
-Copies a file — or, if `<path>` is a folder, everything under it — out of the last save into your working folder, overwriting the working copy, with its saved permissions. This is the "I mangled this file, give me back the good one" command.
+### `sb restore <anchor | save | deploy-label | branch>`
+
+Returns the current branch to any past state — **by creating a new save** whose content equals that state, exactly like `undo` but to an arbitrary point. Nothing is rewound and nothing is deleted: the saves in between stay fully in the log and journal, the restore itself is a journaled, chain-linked operation, and `sb undo` immediately afterward takes you straight back. Requires a clean working tree.
+
+The target can be named four ways, resolved in this order of intent:
+
+- **An anchor** — any 8–64 hex characters of a journal chain link (the 16-character values `verify` and `journal` print). An anchor names a *moment*, so it resolves to the current branch's tip **as the journal recorded it at that moment** — "put this branch back the way it was when I noted this value." The output names the moment: `restored to anchor 67b3dea8b260c12a (2026-07-14 08:35, main)`. Because the store is append-only and every blob is re-hash-verified on read, the past state is guaranteed present and guaranteed intact.
+- **A save-hash prefix** from `sb log` (4+ characters, unique).
+- **A deploy label** — `sb restore rel-3` puts the branch back to exactly what shipped.
+- **A branch name** — its current tip's content.
+
+Ambiguous targets (a prefix matching several saves, or a name matching two different things) are rejected with what matched, never guessed. Restoring to a state the branch already has is a no-op, not a redundant save. Note the scope: `restore` recreates *content* on the current branch — it does not resurrect removed branch pointers or rewind the journal, because the journal is the record of what happened, including this.
 
 ### `sb branch [<name>] [-r]`
 
@@ -460,6 +482,8 @@ If the anchor is a link in the current chain, everything up to that moment is ex
 
 This is the same trust move that transparency logs and blockchain checkpoints make — externalize one small value, protect an unbounded history — implemented with a single SHA-256 and no infrastructure. Anchor as often as your paranoia requires; each anchor protects everything before it.
 
+Anchors also work as **bookmarks you can return to**: `sb restore <anchor>` puts the current branch's content back to exactly the state that anchor witnessed — non-destructively, as a new save. Verify with it, restore to it: the same sixteen characters serve both.
+
 ---
 
 ## 10. Portable archives (.sbox)
@@ -585,7 +609,9 @@ Two behaviors worth knowing: ignoring a pattern does not remove already-saved fi
 
 **Safe experiment.** `sb branch spike && sb switch spike`, hack freely with saves as checkpoints. If it works: `sb switch main && sb merge spike`. If it doesn't: `sb switch main` and simply never merge — the branch stays as a record, costing nothing (or remove its pointer with `sb branch spike -r`; the saves stay in history).
 
-**"I broke it ten minutes ago."** `sb diff` to see the damage; `sb restore <file>` to reclaim one file from the last save; `sb undo` to revert the whole last save (non-destructively — you can `sb undo` again to change your mind).
+**"I broke it ten minutes ago."** `sb diff` to see the damage; `sb undo -p <file>` to reclaim one file from the last save; `sb undo` to revert the whole last save (non-destructively — you can `sb undo` again to change your mind).
+
+**"It worked last Tuesday."** Find last Tuesday — an anchor you noted, a save in `sb log`, or a deploy label — and `sb restore <it>`. The branch's content returns to that state as a new save; everything since stays in history, and `sb undo` reverses the trip if you were wrong about Tuesday.
 
 **Release with a paper trail.** Keep the real test suite at `sb-tests/pre-deploy/`. Ship with `sb deploy v1.4`: sb verifies the entire store, runs the suite against a clean checkout of exactly what's shipping, and journals the record. `sb deploy -l` is your release history, protected by the chain.
 
@@ -702,7 +728,7 @@ No — `-i` overwrites files in place, with no per-file backup. Files the archiv
 
 **`error: sb <command>: unrecognized arguments: …` / `missing: …`** — the flag or argument doesn't exist for that command; the correct usage line is printed right below the error. `sb help` shows the full menu.
 
-**`error: you have unsaved changes`** — `switch`, `merge`, and `undo` refuse to run over uncommitted work, always. `sb save "wip"` (saves are cheap and undo is free), or `sb restore <path>` for changes you want gone.
+**`error: you have unsaved changes`** — `switch`, `merge`, and `undo` refuse to run over uncommitted work, always. `sb save "wip"` (saves are cheap and undo is free), or `sb undo -p <path>` for changes you want gone.
 
 **`error: <folder> is not empty — unpack into a fresh folder`** (or **`<folder>/.sb (an sb repository) — …`**) — unpack never writes into a destination that already contains anything, repository or not. Pick a fresh folder, or — if you *mean* to overwrite matching files in place, e.g. redeploying a release — add `-i`/`--ignore-dir`. Matching paths are replaced with the archive's version; everything else in the folder is kept.
 
@@ -712,7 +738,7 @@ No — `-i` overwrites files in place, with no per-file backup. Files the archiv
 
 **`merge stopped — these files conflict`** — the reason is printed per file. Your worktree was not touched. Reconcile the file on one branch (copy the other branch's version over it, or hand-combine), save, merge again.
 
-**`object … does not match its hash` / `sb verify` reports problems** — real corruption or tampering was detected; sb stopped rather than propagating it. Restore `.sb/sandbox.db` from a backup, then `sb verify` again. Undamaged files can be rescued first via `sb restore` from saves whose objects are intact.
+**`object … does not match its hash` / `sb verify` reports problems** — real corruption or tampering was detected; sb stopped rather than propagating it. Restore `.sb/sandbox.db` from a backup, then `sb verify` again. Undamaged files can be rescued first via `sb undo -p` / `sb export` from saves whose objects are intact.
 
 **`store error: … database is locked`** — another sb command (or something else) has the database open for writing. Wait a moment and retry.
 
