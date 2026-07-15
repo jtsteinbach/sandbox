@@ -6,21 +6,11 @@
 
 sb is not a git clone and does not use git's repository format. It keeps the two ideas git got right — content addressing and a Merkle DAG of snapshots — and replaces everything that makes git hostile to daily use: the staging area, detached HEADs, destructive commands, a repository made of thousands of fragile loose files, and error messages written for git's own developers.
 
-```
-$ sb init
-$ sb save "first version of the landing page"
-saved 8163c18fe1 on main · 12 file(s)
-  └─── "first version of the landing page"
-```
-
-That is the entire mental model: **you work, you save.** Everything else — branches, merges, quality gates, deployment records, tamper detection — builds on those two verbs.
-
----
 
 ## Table of contents
 
-1. [Why sb exists](#1-why-sb-exists)
-2. [Installation](#2-installation)
+1. [Installation](#1-installation)
+2. [Why sandbox exists](#2-why-sb-exists)
 3. [Five-minute quickstart](#3-five-minute-quickstart)
 4. [Core concepts](#4-core-concepts)
 5. [Command reference](#5-command-reference)
@@ -41,21 +31,7 @@ That is the entire mental model: **you work, you save.** Everything else — bra
 
 ---
 
-## 1. Why sb exists
-
-Version control solves a real problem: *"I want to change things without fear, and know exactly what happened later."* Git solves that problem too — wrapped in an interface where `checkout` means four different things, where a mistyped `reset --hard` erases an afternoon of work, and where the repository itself is a directory of thousands of loose files that a power cut can leave half-written.
-
-sb starts from three convictions.
-
-**Safety should be structural, not disciplinary.** In sb there is no command that discards saved history. `undo` creates *new* history that reverts the old. `switch` refuses to run over unsaved work. The store is one SQLite database, so every operation is a single atomic transaction — a crash mid-save leaves you exactly where you were, never in a torn in-between state.
-
-**A tool can be simple without being a toy.** sb has no staging area (a save snapshots everything that isn't ignored), no detached HEAD (you are always on a branch), and no rebase (history is append-only). Yet it has real branches, real three-way merges with automatic conflict-free merging, versioned test gates that block bad saves, deployment records, and a full-store integrity verifier.
-
-**Security features should be honest.** sb makes exactly three security promises — integrity, tamper evidence, and leak prevention — and Section 8 states precisely how each is achieved, what it defends against, and what it deliberately does not. There are no keys to lose, no signatures to misunderstand, and no cryptography library in the dependency tree. Everything rests on one primitive: SHA-256 from Python's standard library, used for content addressing and hash chaining.
-
----
-
-## 2. Installation
+## 1. Installation
 
 Requirements: Python 3.9+ (standard library only — no pip, no dependencies).
 
@@ -89,6 +65,20 @@ chmod +x ~/.local/bin/sb
 If `~/.local/bin` is not on your PATH, add `export PATH="$HOME/.local/bin:$PATH"` to your shell profile. On Windows, run it as `python sb.py <command>` or create a small `sb.bat` wrapper.
 
 To upgrade, re-run the install command. sb refuses to open repositories created by a *newer* format than it understands, so upgrades are always safe and downgrades fail loudly rather than corrupting anything.
+
+---
+
+## 2. Why sb exists
+
+Version control solves a real problem: *"I want to change things without fear, and know exactly what happened later."* Git solves that problem too — wrapped in an interface where `checkout` means four different things, where a mistyped `reset --hard` erases an afternoon of work, and where the repository itself is a directory of thousands of loose files that a power cut can leave half-written.
+
+sb starts from three convictions.
+
+**Safety should be structural, not disciplinary.** In sb there is no command that discards saved history. `undo` creates *new* history that reverts the old. `switch` refuses to run over unsaved work. The store is one SQLite database, so every operation is a single atomic transaction — a crash mid-save leaves you exactly where you were, never in a torn in-between state.
+
+**A tool can be simple without being a toy.** sb has no staging area (a save snapshots everything that isn't ignored), no detached HEAD (you are always on a branch), and no rebase (history is append-only). Yet it has real branches, real three-way merges with automatic conflict-free merging, versioned test gates that block bad saves, deployment records, and a full-store integrity verifier.
+
+**Security features should be honest.** sb makes exactly three security promises — integrity, tamper evidence, and leak prevention — and Section 8 states precisely how each is achieved, what it defends against, and what it deliberately does not. There are no keys to lose, no signatures to misunderstand, and no cryptography library in the dependency tree. Everything rests on one primitive: SHA-256 from Python's standard library, used for content addressing and hash chaining.
 
 ---
 
