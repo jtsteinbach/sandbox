@@ -22,7 +22,8 @@ Tables: meta, objects, refs, journal, statcache.
 
 
 import sys, os, io, json, time, zlib, hashlib, fnmatch, difflib, re
-import sqlite3, subprocess, tempfile, getpass
+import argparse
+import sqlite3, subprocess, tempfile, getpass, shutil
 from pathlib import Path
 
 VERSION = "1.0"
@@ -246,6 +247,14 @@ class Repo:
         self.journal(op, {"branch": branch, "old": old or "",
                           "new": commit_hash or ""})
 
+    def remove_ref(self, branch):
+        """Delete a branch tip. ALWAYS journaled — refs cannot vanish invisibly."""
+        old = self.tip(branch)
+        with self.db:
+            self.db.execute("DELETE FROM refs WHERE name=?", (branch,))
+        self.journal("branch-remove", {"branch": branch, "old": old or "",
+                                       "new": ""})
+
     # ---- journal: append-only, hash-chained audit log ----
     def chain_head(self):
         row = self.db.execute(
@@ -330,7 +339,7 @@ def author():
     return name, email
 
 # ------------------------------------------------------------- ignores ------
-DEFAULT_IGNORES = [SB_DIR, "*.pyc", "__pycache__", ".DS_Store",
+DEFAULT_IGNORES = [SB_DIR, "*.sbox", "*.pyc", "__pycache__", ".DS_Store",
                    ".git", "node_modules"]
 
 def load_ignores(root: Path):
@@ -879,6 +888,19 @@ def cmd_branch(args):
                     + "  " + amber(short(repo.tip(b)))
                     for b in branches])
         return
+    if args.remove:
+        if args.name not in repo.branches():
+            die(f"no branch named '{args.name}'")
+        if args.name == repo.current_branch():
+            die(f"'{args.name}' is the current branch — switch away first")
+        if len(repo.branches()) == 1:
+            die("cannot remove the last branch")
+        tip = repo.tip(args.name)
+        repo.remove_ref(args.name)
+        print(f"{dim('removed branch')} {bold(args.name)} "
+              f"{dim('(was at')} {amber(short(tip))}{dim(')')}")
+        leaf(dim("its saves stay in history — nothing was deleted from the store"))
+        return
     if not safe_name(args.name) or args.name.startswith("-"):
         die(f"'{args.name}' is not a valid branch name")
     if args.name in repo.branches():
@@ -985,9 +1007,45 @@ def cmd_merge(args):
     if auto_merged:
         leaf(dim(f"{len(auto_merged)} file(s) auto-merged line by line"))
 
+TEST_GUIDE = f"""\
+{bold('setting up test scripts')}
+{amber(RULE)}
+
+Tests are plain executable scripts inside {bold('sb-tests/<stage>/')} in your
+repo. Any language works — sb only cares about the {bold('exit code')}:
+exit {bold('0')} means pass, anything else means fail.
+
+{amber('stages')}
+  {amber('\u251c\u2500\u2500\u2500')} pre-save    {dim('runs before every save — the gate for bad snapshots')}
+  {amber('\u251c\u2500\u2500\u2500')} pre-merge   {dim('runs before a merge is committed')}
+  {amber('\u2514\u2500\u2500\u2500')} pre-deploy  {dim('runs before a deploy is recorded')}
+
+{amber('quick start')}
+  {amber('\u251c\u2500\u2500\u2500')} sb test new pre-save smoke     {dim('scaffold sb-tests/pre-save/smoke.sh')}
+  {amber('\u251c\u2500\u2500\u2500')} $EDITOR sb-tests/pre-save/smoke.sh
+  {amber('\u251c\u2500\u2500\u2500')} sb test                        {dim('run every stage now')}
+  {amber('\u2514\u2500\u2500\u2500')} sb save "msg"                  {dim('gates now run automatically')}
+
+{amber('how they run')}
+  {amber('\u251c\u2500\u2500\u2500')} each script runs in a {bold('pristine temp checkout')} of HEAD —
+  {amber('\u2502')}    never your working folder, so tests cannot dirty your files
+  {amber('\u251c\u2500\u2500\u2500')} env vars provided: {dim('SB_STAGE · SB_BRANCH · SB_COMMIT · SB_REPO')}
+  {amber('\u251c\u2500\u2500\u2500')} timeout {dim('per script:')} {TEST_TIMEOUT}s {dim('(override with SB_TEST_TIMEOUT)')}
+  {amber('\u2514\u2500\u2500\u2500')} skip once with --no-verify {dim('(the skip is journaled)')}
+
+{amber('example')}  {dim('sb-tests/pre-save/smoke.sh')}
+  #!/bin/sh
+  python3 -m py_compile app.py || exit 1
+  ./app.py --self-check        || exit 1
+  exit 0
+"""
+
 def cmd_test(args):
     repo = need_repo()
     sub = args.args
+    if sub and sub[0] in ("guide", "help"):
+        print(TEST_GUIDE)
+        return
     if sub and sub[0] == "new":
         if len(sub) != 3 or sub[1] not in STAGES:
             die(f"usage: sb test new <{'|'.join(STAGES)}> <name>")
@@ -1027,6 +1085,8 @@ def cmd_test(args):
     sys.exit(0 if ok else 2)
 
 def cmd_deploy(args):
+    if args.label == "list":               # word form of --list, like 'sb test list'
+        args.list, args.label = True, None
     repo = need_repo()
     if args.list:
         recs = [e for e in repo.journal_entries() if e["op"] == "deploy"]
@@ -1067,7 +1127,8 @@ def cmd_deploy(args):
     print(f"{bold('deployed')} {amber(short(head))} {dim('as')} "
           f"{bold(args.label or 'deploy')}")
     leaf(dim("journaled · anchor ") + amber(link[:16])
-         + dim("  (sb deploy --list)"))
+         + dim(f"  (list: sb deploy --list · get files: "
+               f"sb export {args.label or 'deploy'})"))
 
 def _verify(repo, quiet=False, anchor=None):
     """Full store verification. Returns True if everything checks out.
@@ -1133,6 +1194,8 @@ def _verify(repo, quiet=False, anchor=None):
         if e["op"] in ("save", "merge", "undo", "branch", "ref"):
             d = e["detail"]
             expected[d["branch"]] = d["new"]
+        elif e["op"] == "branch-remove":
+            expected.pop(e["detail"]["branch"], None)
     for b in repo.branches():
         cur = repo.tip(b) or ""
         if b in expected and expected[b] != cur:
@@ -1213,7 +1276,7 @@ def cmd_journal(args):
         else:
             what = ""
         print(f"{dim('#%-4d' % e['seq'])} {when}  {bold('%-7s' % e['op'])} "
-              f"{what}  {dim(e['link'][:12] + '…')}")
+              f"{what}  {amber(e['link'][:16])}")
     leaf(status)
 
 def cmd_info(args):
@@ -1268,28 +1331,260 @@ def cmd_ignore(args):
 # ------------------------------------------------------- portable archive ---
 # 'sb pack' seals the entire repository (the single sandbox.db) plus a small
 # manifest into one encrypted .sbox file; 'sb unpack' reverses it. Encryption
-# is provided by vox (jts.gg/vox), fetched fresh at run time so sb itself
-# carries no cryptography and no bundled copy to drift out of date.
+# is provided by vox (embedded below), so both commands work fully offline.
 SBOX_MAGIC = b"SBOX"
 SBOX_VERSION = 1
-VOX_URL = "https://raw.githubusercontent.com/jtsteinbach/vox/main/vox.py"
+
+# vox v1.7.3 (jts.gg/vox) — embedded verbatim so pack/unpack work fully
+# offline. It is loaded into an in-memory module only when those two
+# commands run; nothing else in sb touches it.
+VOX_SOURCE = r"""
+#  Vox Encryption Module      v1.7.3
+#  Documentation          jts.gg/vox
+#  License         r2.jts.gg/license
+#
+#  this module implements a misuse-resistant AEAD using:
+#    - HMAC-SHA512 (PRF)
+#    - PBKDF2-HMAC-SHA512 (key stretching)
+#    - HKDF-Expand (RFC 5869) (key separation)
+#
+#  security properties:
+#    - AEAD confidentiality and authenticity
+#    - nonce misuse resistance (SIV)
+#    - key separation
+#    - RNG failure resistance
+#
+#  misuse bounds and limits:
+#  - repeated encryption of identical plaintext with identical
+#    associated data reveals equality only
+#  - authenticity is always preserved
+#  - recommended maximum data encrypted per key: 2^40 bytes (1TB) - hard limit: 2^46 bytes (64TB)
+
+import os
+import hashlib
+import hmac
+import base64
+
+SALT_LEN        = 64        # synthetic nonce length (SIV)
+TAG_LEN         = 64        # AEAD authentication tag length
+KDF_ITERS       = 300_000   # PBKDF2 work factor
+KDF_KEY_LEN     = 64        # master key length
+KEM_LEN         = 64        # legacy asymmetric prefix length
+
+# internal context cache
+# ensures PBKDF2 is executed once per key lifecycle
+
+_CTX_CACHE = {}
+
+# key setup context
+
+class VoxContext:
+    # holds stretched and separated keys
+
+    def __init__(self, passkey: bytes):
+        master = _kdf(passkey)
+
+        self.enc_key = _hkdf_expand(master, b"vox enc", 64)
+        self.mac_key = _hkdf_expand(master, b"vox mac", 64)
+
+# internal helper
+
+def _get_context(passkey: bytes) -> VoxContext:
+    ctx = _CTX_CACHE.get(passkey)
+    if ctx is None:
+        ctx = VoxContext(passkey)
+        _CTX_CACHE[passkey] = ctx
+    return ctx
+
+# public API
+
+def encrypt(
+    plaintext: bytes,
+    passkey: str,
+    *,
+    associated_data: bytes = b"",
+    asym: bool = False
+) -> bytes:
+    # encrypts plaintext using AEAD
+    # associated_data is authenticated but not encrypted
+
+    pt = plaintext
+
+    if asym:
+        enc, shared = _kem_encapsulate(passkey)
+        ctx = _get_context(shared)
+        ct = _aead_encrypt(ctx, pt, associated_data)
+        return enc + ct
+
+    ctx = _get_context(passkey.encode())
+    return _aead_encrypt(ctx, pt, associated_data)
+
+
+def decrypt(
+    ciphertext: bytes,
+    passkey: str,
+    *,
+    associated_data: bytes = b"",
+    asym: bool = False
+) -> bytes:
+    # verifies authenticity before decryption
+
+    if asym:
+        enc = ciphertext[:KEM_LEN]
+        ct  = ciphertext[KEM_LEN:]
+        shared = _kem_decapsulate(enc, passkey)
+        ctx = _get_context(shared)
+        pt = _aead_decrypt(ctx, ct, associated_data)
+        return pt
+
+    ctx = _get_context(passkey.encode())
+    pt = _aead_decrypt(ctx, ciphertext, associated_data)
+    return pt
+
+# AEAD core
+
+def _aead_encrypt(
+    ctx: VoxContext,
+    plaintext: bytes,
+    associated_data: bytes
+) -> bytes:
+    # SIV-style AEAD construction
+
+    salt = hmac.new(
+        ctx.mac_key,
+        associated_data + plaintext,
+        hashlib.sha512
+    ).digest()[:SALT_LEN]
+
+    stream = _derive_keystream(ctx.enc_key, salt, len(plaintext))
+    ciphertext = bytes(a ^ b for a, b in zip(plaintext, stream))
+
+    tag = hmac.new(
+        ctx.mac_key,
+        salt + associated_data + ciphertext,
+        hashlib.sha512
+    ).digest()
+
+    return salt + ciphertext + tag
+
+
+def _aead_decrypt(
+    ctx: VoxContext,
+    data: bytes,
+    associated_data: bytes
+) -> bytes:
+    # verifies authentication prior to decryption
+
+    salt = data[:SALT_LEN]
+    tag  = data[-TAG_LEN:]
+    ct   = data[SALT_LEN:-TAG_LEN]
+
+    expected = hmac.new(
+        ctx.mac_key,
+        salt + associated_data + ct,
+        hashlib.sha512
+    ).digest()
+
+    if not hmac.compare_digest(tag, expected):
+        raise ValueError("authentication failed")
+
+    stream = _derive_keystream(ctx.enc_key, salt, len(ct))
+    return bytes(a ^ b for a, b in zip(ct, stream))
+
+# key derivation
+
+def _kdf(passkey: bytes) -> bytes:
+    # PBKDF2-HMAC-SHA512 is used solely for key stretching
+
+    return hashlib.pbkdf2_hmac(
+        "sha512",
+        passkey,
+        b"vox-static-salt-SS7419",
+        KDF_ITERS,
+        dklen=KDF_KEY_LEN
+    )
+
+
+def _hkdf_expand(prk: bytes, info: bytes, length: int) -> bytes:
+    # HKDF-Expand as defined in RFC 5869
+
+    out = b""
+    t = b""
+    counter = 1
+
+    while len(out) < length:
+        t = hmac.new(
+            prk,
+            t + info + bytes([counter]),
+            hashlib.sha512
+        ).digest()
+        out += t
+        counter += 1
+
+    return out[:length]
+
+# keystream generation
+
+def _derive_keystream(
+    key: bytes,
+    nonce: bytes,
+    length: int
+) -> bytes:
+    # PRF keystream generator
+
+    out = bytearray()
+    counter = 0
+
+    while len(out) < length:
+        block = hmac.new(
+            key,
+            nonce + counter.to_bytes(5, "big"),
+            hashlib.sha512
+        ).digest()
+        out.extend(block)
+        counter += 1
+
+    return bytes(out[:length])
+
+# legacy asymmetric (non-standard)
+# does not provide forward secrecy and is excluded from security claims
+
+def keypair():
+    sk = os.urandom(64)
+    pk = hashlib.sha512(sk).digest()
+    return (
+        base64.b64encode(pk).decode(),
+        base64.b64encode(sk).decode()
+    )
+
+
+def _kem_encapsulate(pk_b64: str):
+    pk = base64.b64decode(pk_b64)
+    r = os.urandom(64)
+    mask = hashlib.sha512(pk).digest()
+    enc = bytes(a ^ b for a, b in zip(r, mask))
+    shared = hashlib.sha512(r + pk).digest()
+    return enc, shared
+
+
+def _kem_decapsulate(enc: bytes, sk_b64: str):
+    sk = base64.b64decode(sk_b64)
+    pk = hashlib.sha512(sk).digest()
+    mask = hashlib.sha512(pk).digest()
+    r = bytes(a ^ b for a, b in zip(enc, mask))
+    return hashlib.sha512(r + pk).digest()
+"""
 
 def load_vox():
-    """Fetch vox.py over https with the stdlib only and load it in memory."""
-    import urllib.request, types
-    try:
-        with urllib.request.urlopen(VOX_URL, timeout=30) as r:
-            code = r.read().decode("utf-8")
-    except Exception as e:
-        die(f"could not fetch the encryption module from {VOX_URL}\n"
-            f"       ({e}) — check your connection and try again")
+    """Load the embedded vox module in memory (no disk, no network)."""
+    import types
     mod = types.ModuleType("vox")
     try:
-        exec(compile(code, "vox.py", "exec"), mod.__dict__)
+        exec(compile(VOX_SOURCE, "vox.py", "exec"), mod.__dict__)
     except Exception as e:
-        die(f"the encryption module failed to load: {e}")
+        die(f"the embedded encryption module failed to load: {e}")
     if not (hasattr(mod, "encrypt") and hasattr(mod, "decrypt")):
-        die("the encryption module is missing encrypt/decrypt — refusing to run")
+        die("the embedded encryption module is missing encrypt/decrypt")
     return mod
 
 def _frame(manifest: dict, db: bytes) -> bytes:
@@ -1314,10 +1609,59 @@ def _snapshot_db(repo: Repo) -> bytes:
     tmp.unlink(); tmp.parent.rmdir()
     return data
 
+def _tar_tree(repo, tree) -> bytes:
+    """Serialize a saved tree's files into an in-memory tar."""
+    import tarfile, io
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as t:
+        for rel in sorted(tree):
+            mode, bh = tree[rel]
+            _, data = repo.get(bh)
+            info = tarfile.TarInfo(rel)
+            info.size = len(data)
+            info.mode = 0o755 if mode == "100755" else 0o644
+            info.mtime = int(time.time())
+            t.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+def _untar_files(data: bytes, dest: Path) -> int:
+    """Safely extract an archive's files into dest. Returns file count."""
+    import tarfile, io
+    n = 0
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r") as t:
+        for m in t.getmembers():
+            if not m.isreg():
+                continue
+            parts = Path(m.name).parts
+            if (m.name.startswith("/") or any(p in ("..", SB_DIR) for p in parts)
+                    or not all(safe_name(p) for p in parts)):
+                die(f"archive contains an unsafe path: {m.name!r} — refusing")
+            out = dest / m.name
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(t.extractfile(m).read())
+            try:
+                os.chmod(out, m.mode & 0o777)
+            except OSError:
+                pass
+            n += 1
+    return n
+
 def cmd_pack(args):
     repo = need_repo()
-    if not args.passkey:
-        die("a pass-key is required:  sb pack <PASS-KEY> [out.sbox]")
+    # canonical: sb pack [out] --key <PASS-KEY>; classic 'sb pack KEY [out]' works too
+    extra = list(args.params)
+    if args.key:
+        key = args.key
+        if len(extra) > 1:
+            die("too many arguments — with --key, give at most one output name")
+        out_name = extra[0] if extra else None
+    else:
+        if not extra:
+            die("a pass-key is required:  sb pack --key <PASS-KEY> [out.sbox]")
+        if len(extra) > 2:
+            die("too many arguments — usage: sb pack --key <PASS-KEY> [out.sbox]")
+        key = extra[0]
+        out_name = extra[1] if len(extra) > 1 else None
     work = snapshot_worktree(repo, write=False)
     tree, _ = head_tree_files(repo)
     a, m, d = worktree_vs_tree(work, tree)
@@ -1327,27 +1671,36 @@ def cmd_pack(args):
               "to capture them."))
     vox = load_vox()
     name, email = author()
-    db = _snapshot_db(repo)
+    if args.files_only:
+        if not tree:
+            die("nothing saved yet — files-only pack needs at least one save")
+        payload_kind = "files"
+        body = _tar_tree(repo, tree)
+    else:
+        payload_kind = "repo"
+        body = _snapshot_db(repo)
     manifest = {
         "format": "sbox",
         "sbox_version": SBOX_VERSION,
         "sb_version": VERSION,
+        "payload": payload_kind,
         "created": int(time.time()),
         "created_by": {"name": name, "email": email},
         "repo_id": repo.meta("repo_id"),
         "repo_name": repo.root.name,
         "branch": repo.current_branch(),
         "chain_head": repo.chain_head(),
-        "db_sha256": sha256_hex(db),
-        "db_size": len(db),
+        "files": len(tree),
+        "db_sha256": sha256_hex(body),
+        "db_size": len(body),
     }
-    out = Path(args.out) if args.out else Path(f"{repo.root.name}.sbox")
+    out = Path(out_name) if out_name else Path(f"{repo.root.name}.sbox")
     if out.suffix != ".sbox":
         out = out.with_name(out.name + ".sbox")
     if out.exists():
         die(f"{out} already exists — choose another name or remove it")
     header = SBOX_MAGIC + bytes([SBOX_VERSION])
-    blob = vox.encrypt(_frame(manifest, db), args.passkey, associated_data=header)
+    blob = vox.encrypt(_frame(manifest, body), key, associated_data=header)
     tmp = out.with_name(out.name + ".sbtmp")
     tmp.write_bytes(header + blob)
     try:
@@ -1357,18 +1710,38 @@ def cmd_pack(args):
     os.replace(tmp, out)
     size = out.stat().st_size
     print(f"{bold('packed')} {amber(out.name)} {dim('·')} {dim(f'{size:,} bytes')}")
+    what = (f"files only · {len(tree)} file(s), no history"
+            if args.files_only else "full history + files")
     tree_print([
         f"branch   {manifest['branch']} {dim('· anchor')} {amber(manifest['chain_head'][:16])}",
+        f"holds    {what}",
         f"sealed   {name} <{email}>  "
         + dim(time.strftime('%Y-%m-%d %H:%M', time.localtime(manifest['created']))),
         dim("encrypted with vox · unpack: sb unpack "
-            + out.name + " <PASS-KEY>"),
+            + out.name + " --key <PASS-KEY>"),
     ])
 
 def cmd_unpack(args):
-    if not args.path or not args.passkey:
-        die("usage:  sb unpack <path/to/file.sbox> <PASS-KEY> [dest]")
-    src = Path(args.path)
+    # canonical: sb unpack <file> [dest] --key <PASS-KEY>;
+    # classic 'sb unpack <file> KEY [dest]' works too
+    extra = list(args.params)
+    if not extra:
+        die("usage:  sb unpack <file.sbox> --key <PASS-KEY> [dest]")
+    path_name = extra.pop(0)
+    if args.key:
+        key = args.key
+        if len(extra) > 1:
+            die("too many arguments — with --key, give at most one destination")
+        dest_name = extra[0] if extra else None
+    else:
+        if not extra:
+            die("usage:  sb unpack <file.sbox> --key <PASS-KEY> [dest]")
+        if len(extra) > 2:
+            die("too many arguments — usage: sb unpack <file.sbox> "
+                "--key <PASS-KEY> [dest]")
+        key = extra[0]
+        dest_name = extra[1] if len(extra) > 1 else None
+    src = Path(path_name)
     if not src.is_file():
         die(f"no such file: {src}")
     raw = src.read_bytes()
@@ -1381,45 +1754,205 @@ def cmd_unpack(args):
     header, blob = raw[:5], raw[5:]
     vox = load_vox()
     try:
-        payload = vox.decrypt(blob, args.passkey, associated_data=header)
+        payload = vox.decrypt(blob, key, associated_data=header)
     except Exception:
         die("could not open the archive — wrong pass-key or the file was "
             "altered\n       (vox verifies authenticity before decrypting)")
-    manifest, db = _unframe(payload)
-    if sha256_hex(db) != manifest.get("db_sha256"):
-        die("archive integrity check failed — the store did not match its "
-            "recorded hash")
-    dest = Path(args.dest) if args.dest else Path(manifest.get("repo_name", "sandbox"))
+    manifest, body = _unframe(payload)
+    if sha256_hex(body) != manifest.get("db_sha256"):
+        die("archive integrity check failed — the contents did not match "
+            "their recorded hash")
+    kind = manifest.get("payload", "repo")
+    dest = Path(dest_name) if dest_name else Path(manifest.get("repo_name", "sandbox"))
     if (dest / SB_DIR).exists():
         die(f"{dest / SB_DIR} already exists — unpack into a fresh folder")
     who = manifest.get("created_by", {})
     when = time.strftime("%Y-%m-%d %H:%M", time.localtime(manifest.get("created", 0)))
-    (dest / SB_DIR).mkdir(parents=True, exist_ok=True)
-    db_path = dest / SB_DIR / DB_NAME
-    db_path.write_bytes(db)
-    try:
-        os.chmod(db_path, 0o600)
-    except OSError:
-        pass
-    repo = Repo(dest.resolve())
-    tree, _ = head_tree_files(repo)
-    checkout_tree(repo, tree, {})
-    print(f"{bold('unpacked')} {amber(str(dest))} {dim('·')} {dim(str(len(tree)) + ' file(s)')}")
+    files_only = args.files_only or kind == "files"
+
+    if kind == "files":
+        # archive holds files, no history — extraction is inherently files-only
+        dest.mkdir(parents=True, exist_ok=True)
+        n = _untar_files(body, dest)
+        held = "files only — this archive carries no history"
+    elif files_only:
+        # full-history archive, but the user wants just the native files:
+        # restore the store in a temp area, check out from there, keep no .sb
+        stage = Path(tempfile.mkdtemp(prefix="sb-unpack-"))
+        try:
+            (stage / SB_DIR).mkdir()
+            (stage / SB_DIR / DB_NAME).write_bytes(body)
+            srepo = Repo(stage.resolve())
+            tree, _ = head_tree_files(srepo)
+            dest.mkdir(parents=True, exist_ok=True)
+            n = _untar_files(_tar_tree(srepo, tree), dest)
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
+        held = "files only — history was in the archive but not written"
+    else:
+        (dest / SB_DIR).mkdir(parents=True, exist_ok=True)
+        db_path = dest / SB_DIR / DB_NAME
+        db_path.write_bytes(body)
+        try:
+            os.chmod(db_path, 0o600)
+        except OSError:
+            pass
+        repo = Repo(dest.resolve())
+        tree, _ = head_tree_files(repo)
+        checkout_tree(repo, tree, {})
+        n = len(tree)
+        held = None
+
+    print(f"{bold('unpacked')} {amber(str(dest))} {dim('·')} {dim(str(n) + ' file(s)')}")
+    rows = [f"sealed by  {who.get('name','?')} <{who.get('email','?')}>  {dim('· ' + when)}",
+            f"branch     {manifest.get('branch','main')} "
+            + dim("· anchor ") + amber(manifest.get("chain_head","")[:16])]
+    if held:
+        rows.append(dim(held))
+    else:
+        rows.append(dim(f"verify it: cd {dest} && sb verify"))
+    tree_print(rows)
+
+def _resolve_version(repo, what):
+    """Resolve a deploy label, branch name, or save-hash prefix to a commit.
+    Returns (commit_hash, human description of how it matched)."""
+    recs = [e for e in repo.journal_entries()
+            if e["op"] == "deploy" and e["detail"].get("label") == what]
+    if recs:
+        d = recs[-1]["detail"]
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(recs[-1]["ts"]))
+        return d["commit"], f"deploy '{what}' ({when})"
+    if what in repo.branches():
+        t = repo.tip(what)
+        if not t:
+            die(f"branch '{what}' has no saves yet")
+        return t, f"branch '{what}'"
+    if re.fullmatch(r"[0-9a-f]{4,64}", what or ""):
+        rows = repo.db.execute(
+            "SELECT hash FROM objects WHERE kind='commit' AND hash LIKE ?",
+            (what + "%",)).fetchall()
+        if len(rows) == 1:
+            return rows[0][0], "save " + short(rows[0][0])
+        if len(rows) > 1:
+            die(f"'{what}' matches {len(rows)} saves — give more characters")
+    die(f"nothing named '{what}' — not a deploy label, branch, or save hash\n"
+        f"       (see labels: sb deploy --list · see saves: sb log)")
+
+def cmd_export(args):
+    repo = need_repo()
+    extra = list(args.params)
+    if not extra:
+        die("usage:  sb export <label|branch|hash> [dest] [--key PASS-KEY]")
+    if len(extra) > 2:
+        die("too many arguments — usage: sb export <version> [dest] "
+            "[--key PASS-KEY]")
+    what, dest_name = extra[0], (extra[1] if len(extra) > 1 else None)
+    commit_hash, how = _resolve_version(repo, what)
+    c = parse_commit(repo, commit_hash)
+    tree = read_tree(repo, c["tree"])
+    if not tree:
+        die(f"{how} contains no files")
+    name, email = author()
+
+    key = args.key or (args.sbox or None)
+    sbox_mode = args.key is not None or args.sbox is not None
+    if sbox_mode:
+        if not key:
+            die("a pass-key is required:  sb export <version> --key <PASS-KEY>")
+        vox = load_vox()
+        body = _tar_tree(repo, tree)
+        manifest = {
+            "format": "sbox", "sbox_version": SBOX_VERSION,
+            "sb_version": VERSION, "payload": "files",
+            "created": int(time.time()),
+            "created_by": {"name": name, "email": email},
+            "repo_id": repo.meta("repo_id"),
+            "repo_name": repo.root.name,
+            "branch": repo.current_branch(),
+            "label": what, "commit": commit_hash,
+            "chain_head": repo.chain_head(),
+            "files": len(tree),
+            "db_sha256": sha256_hex(body), "db_size": len(body),
+        }
+        out = Path(dest_name) if dest_name else Path(f"{repo.root.name}-{what}.sbox")
+        if out.suffix != ".sbox":
+            out = out.with_name(out.name + ".sbox")
+        if out.exists():
+            die(f"{out} already exists — choose another name or remove it")
+        header = SBOX_MAGIC + bytes([SBOX_VERSION])
+        blob = vox.encrypt(_frame(manifest, body), key,
+                           associated_data=header)
+        tmp = out.with_name(out.name + ".sbtmp")
+        tmp.write_bytes(header + blob)
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, out)
+        print(f"{bold('exported')} {amber(out.name)} {dim('·')} "
+              f"{dim(f'{out.stat().st_size:,} bytes')}")
+        tree_print([
+            f"version  {how} {dim('·')} {amber(short(commit_hash))}",
+            f"holds    files only · {len(tree)} file(s), no history",
+            dim(f"deploy it: sb unpack {out.name} --key <PASS-KEY> "
+                f"/path/to/production --files-only"),
+        ])
+        return
+
+    dest = Path(dest_name) if dest_name else Path(f"{repo.root.name}-{what}")
+    if dest.exists() and any(dest.iterdir()):
+        die(f"{dest} exists and is not empty — export into a fresh folder")
+    dest.mkdir(parents=True, exist_ok=True)
+    n = _untar_files(_tar_tree(repo, tree), dest)
+    print(f"{bold('exported')} {amber(str(dest))} {dim('·')} {dim(str(n) + ' file(s)')}")
     tree_print([
-        f"sealed by  {who.get('name','?')} <{who.get('email','?')}>  {dim('· ' + when)}",
-        f"branch     {manifest.get('branch','main')} "
-        + dim("· anchor ") + amber(manifest.get("chain_head","")[:16]),
-        dim(f"verify it: cd {dest} && sb verify"),
+        f"version  {how} {dim('·')} {amber(short(commit_hash))}",
+        dim("plain files, no .sb — the repository stays where it is"),
     ])
+
+def _parse_share_args(cmd, tokens):
+    """Order-independent parsing for pack/unpack/export: flags may appear
+    anywhere; everything else stays a positional, in the order given."""
+    params, key, sbox, files_only = [], None, None, False
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        if t in ("-k", "--key"):
+            i += 1
+            if i >= len(tokens):
+                die(f"{t} needs a value:  sb {cmd} ... {t} <PASS-KEY>")
+            key = tokens[i]
+        elif t.startswith("--key="):
+            key = t[len("--key="):]
+        elif cmd == "export" and t == "--sbox":            # legacy alias
+            if i + 1 < len(tokens) and not tokens[i + 1].startswith("-"):
+                i += 1
+                sbox = tokens[i]
+            else:
+                sbox = ""
+        elif cmd == "export" and t.startswith("--sbox="):
+            sbox = t[len("--sbox="):]
+        elif t == "--files-only":
+            files_only = True
+        elif t.startswith("-") and len(t) > 1:
+            die(f"unknown option '{t}' for sb {cmd}")
+        else:
+            params.append(t)
+        i += 1
+    return argparse.Namespace(cmd=cmd, params=params, key=key, sbox=sbox,
+                              files_only=files_only)
 
 # ---------------------------------------------------------------- CLI -------
 def _row(cmd, desc, last=False):
     conn = amber("\u2514\u2500\u2500\u2500" if last else "\u251c\u2500\u2500\u2500")
-    return f"  {conn} {cmd.ljust(21)}{dim(desc)}"
+    return f"  {conn} {cmd.ljust(22)}{dim(desc)}"
 
-HELP = f"""\
+def _sub(text, cont=True):
+    bar = amber("\u2502") if cont else " "
+    return f"  {bar}      {dim(text)}"
+
+HELP = f"""
   {bold('sandbox (sb)')}   {dim('version ' + VERSION)}
-  {amber(RULE)}
   {dim('optimal version control · ' + AUTHOR)}
 
 {amber('work')}
@@ -1432,11 +1965,12 @@ HELP = f"""\
 {_row('restore <path>', 'bring a file or folder back', last=True)}
 
 {amber('branches')}
-{_row('branch [name]', 'list or create branches')}
+{_row('branch [name] [-r]', 'list, create, or remove branches')}
 {_row('switch <branch>', 'move between branches')}
-{_row('merge <branch>', '3-way merge with auto-merge', last=True)}
+{_row('merge <branch>', 'bring <branch> into the current one', last=True)}
 
 {amber('quality')}
+{_row('test guide', 'how to set up test scripts')}
 {_row('test [stage]', 'run test gates in a clean checkout')}
 {_row('test new <s> <n>', 'scaffold a test script')}
 {_row('test list', 'show discovered tests')}
@@ -1444,8 +1978,12 @@ HELP = f"""\
 {_row('verify [--anchor H]', 're-check objects and the journal', last=True)}
 
 {amber('share')}
-{_row('pack <KEY> [out]', 'seal the repo into an encrypted .sbox')}
-{_row('unpack <file> <KEY>', 'restore a .sbox into a folder', last=True)}
+{_row('pack [out] --key K', 'seal the repo into an encrypted .sbox')}
+{_sub('--files-only — seal saved files without history')}
+{_row('unpack <file> --key K', 'restore a .sbox into a folder')}
+{_sub('--files-only — write just the files, no .sb dir')}
+{_row('export <ver> [dest]', 'files of a deploy, branch, or save', last=True)}
+{_sub('--key K — as an encrypted .sbox instead', cont=False)}
 
 {amber('repository')}
 {_row('journal [-n N]', 'log of every operation')}
@@ -1455,7 +1993,6 @@ HELP = f"""\
 """
 
 def main(argv=None):
-    import argparse
     argv = argv if argv is not None else sys.argv[1:]
     if not argv or argv[0] in ("-h", "--help", "help"):
         print(HELP); return
@@ -1473,6 +2010,7 @@ def main(argv=None):
     sub.add_parser("undo")
     rp = sub.add_parser("restore"); rp.add_argument("path")
     bp = sub.add_parser("branch"); bp.add_argument("name", nargs="?")
+    bp.add_argument("-r", "--remove", action="store_true")
     wp = sub.add_parser("switch"); wp.add_argument("target")
     mp = sub.add_parser("merge"); mp.add_argument("branch")
     mp.add_argument("--no-verify", action="store_true")
@@ -1486,12 +2024,19 @@ def main(argv=None):
     who = sub.add_parser("who"); who.add_argument("name", nargs="?")
     who.add_argument("email", nargs="?")
     gp = sub.add_parser("ignore"); gp.add_argument("pattern")
-    pk = sub.add_parser("pack")
-    pk.add_argument("passkey", nargs="?"); pk.add_argument("out", nargs="?")
-    up = sub.add_parser("unpack")
-    up.add_argument("path", nargs="?"); up.add_argument("passkey", nargs="?")
-    up.add_argument("dest", nargs="?")
-    args = p.parse_args(argv)
+    pk = sub.add_parser("pack"); pk.add_argument("params", nargs="*")
+    pk.add_argument("-k", "--key", metavar="PASS-KEY")
+    pk.add_argument("--files-only", action="store_true")
+    up = sub.add_parser("unpack"); up.add_argument("params", nargs="*")
+    up.add_argument("-k", "--key", metavar="PASS-KEY")
+    up.add_argument("--files-only", action="store_true")
+    ex = sub.add_parser("export"); ex.add_argument("params", nargs="*")
+    ex.add_argument("-k", "--key", metavar="PASS-KEY")
+    ex.add_argument("--sbox", nargs="?", const="", metavar="PASS-KEY")
+    if argv and argv[0] in ("pack", "unpack", "export"):
+        args = _parse_share_args(argv[0], argv[1:])
+    else:
+        args = p.parse_args(argv)
     if args.cmd is None:
         print(HELP); return
     try:
