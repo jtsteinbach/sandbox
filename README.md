@@ -6,15 +6,6 @@
 
 sb is not a git clone and does not use git's repository format. It keeps the two ideas git got right — content addressing and a Merkle DAG of snapshots — and replaces everything that makes git hostile to daily use: the staging area, detached HEADs, destructive commands, a repository made of thousands of fragile loose files, and error messages written for git's own developers.
 
-```
-$ sb init
-$ sb save "first version of the landing page"
-saved 8163c18fe1 on main · 12 file(s)
-  └─── "first version of the landing page"
-```
-
-That is the entire mental model: **you work, you save.** Everything else — branches, merges, quality gates, deployment records, tamper detection — builds on those two verbs.
-
 ---
 
 ## Table of contents
