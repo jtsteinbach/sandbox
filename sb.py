@@ -2,11 +2,12 @@
 """
 sandbox (sb) — version control in a single file.
 
-version  1.0
+version  1.1
 author   jts.gg/sandbox
 
-The repository is one SQLite database (.sb/sandbox.db); every operation
-is a single atomic transaction. Objects are addressed by the SHA-256 of
+The repository is one SQLite database (.sb/sandbox.db); every state
+change lands as ONE atomic transaction — a save's objects, ref move,
+and journal entry commit together or not at all. Objects are addressed by the SHA-256 of
 their content and re-verified on every read. An append-only, hash-chained
 journal records every operation; 'sb verify' re-checks the store, the
 chain, and the branch tips end to end. No dependencies beyond the Python
@@ -21,11 +22,11 @@ Tables: meta, objects, refs, journal, statcache.
 """
 
 import sys, os, io, json, time, zlib, hashlib, fnmatch, difflib, re
-import argparse
+import argparse, contextlib
 import sqlite3, subprocess, tempfile, getpass, shutil
 from pathlib import Path
 
-VERSION = "1.0"
+VERSION = "1.1"
 AUTHOR = "jts.gg/sandbox"
 FORMAT_VERSION = 1
 SB_DIR = ".sb"
@@ -108,6 +109,8 @@ CREATE TABLE IF NOT EXISTS statcache (
     path  TEXT PRIMARY KEY,
     size  INTEGER NOT NULL,
     mtime INTEGER NOT NULL,
+    ctime INTEGER NOT NULL DEFAULT 0,
+    ino   INTEGER NOT NULL DEFAULT 0,
     hash  TEXT NOT NULL
 );
 """
@@ -134,13 +137,18 @@ class Repo:
         db_path = self.vdir / DB_NAME
         if create:
             self.vdir.mkdir(parents=True, exist_ok=False)
-        self.db = sqlite3.connect(db_path)
+        # autocommit connection: transactions are explicit and owned by
+        # transaction() below, so nesting can never half-commit an operation
+        self.db = sqlite3.connect(db_path, isolation_level=None)
+        self._tx = 0                     # transaction nesting depth
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.execute("PRAGMA foreign_keys=ON")
         if create:
-            with self.db:
-                self.db.executescript(SCHEMA)
+            with self.transaction():     # schema, meta, refs AND the init
+                for stmt in SCHEMA.split(";"):      # journal entry land as
+                    if stmt.strip():                # one atomic unit
+                        self.db.execute(stmt)
                 repo_id = sha256_hex(os.urandom(32))[:32]
                 self.db.executemany(
                     "INSERT INTO meta(key,value) VALUES(?,?)",
@@ -149,7 +157,7 @@ class Repo:
                      ("branch", "main"),
                      ("created", str(int(time.time())))])
                 self.db.execute("INSERT INTO refs(name,hash) VALUES('main','')")
-            self.journal("init", {"repo_id": repo_id})
+                self.journal("init", {"repo_id": repo_id})
             try:
                 os.chmod(db_path, 0o600)   # private by default
             except OSError:
@@ -160,6 +168,45 @@ class Repo:
         if int(fmt) > FORMAT_VERSION:
             die(f"repository format {fmt} is newer than this sb understands "
                 f"({FORMAT_VERSION}) — upgrade sb")
+        if not create:
+            self._migrate_statcache()
+
+    @contextlib.contextmanager
+    def transaction(self):
+        """ONE atomic unit of work. Nested uses join the outermost
+        transaction, so an entire command — objects, ref move, journal
+        entry — commits together or disappears together. Any exception
+        (including sys.exit) rolls the whole unit back."""
+        if self._tx == 0:
+            self.db.execute("BEGIN IMMEDIATE")
+        self._tx += 1
+        try:
+            yield
+        except BaseException:
+            self._tx -= 1
+            if self._tx == 0:
+                self.db.execute("ROLLBACK")
+            raise
+        else:
+            self._tx -= 1
+            if self._tx == 0:
+                self.db.execute("COMMIT")
+
+    def _migrate_statcache(self):
+        """Older stores keyed the stat cache on (size, mtime) only. Add the
+        ctime and inode columns and drop stale rows — it is only a cache,
+        so the sole cost is one full re-read on the next command."""
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(statcache)")}
+        if "ctime" in cols and "ino" in cols:
+            return
+        with self.transaction():
+            if "ctime" not in cols:
+                self.db.execute("ALTER TABLE statcache ADD COLUMN "
+                                "ctime INTEGER NOT NULL DEFAULT 0")
+            if "ino" not in cols:
+                self.db.execute("ALTER TABLE statcache ADD COLUMN "
+                                "ino INTEGER NOT NULL DEFAULT 0")
+            self.db.execute("DELETE FROM statcache")
 
     # ---- meta ----
     def meta(self, key, default=None):
@@ -167,7 +214,7 @@ class Repo:
         return row[0] if row else default
 
     def set_meta(self, key, value):
-        with self.db:
+        with self.transaction():
             self.db.execute(
                 "INSERT INTO meta(key,value) VALUES(?,?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -176,7 +223,7 @@ class Repo:
     # ---- object store ----
     def put(self, kind: str, data: bytes) -> str:
         h = hash_obj(kind, data)
-        with self.db:
+        with self.transaction():
             self.db.execute(
                 "INSERT OR IGNORE INTO objects(hash,kind,size,data) VALUES(?,?,?,?)",
                 (h, kind, len(data), zlib.compress(data)))
@@ -236,23 +283,27 @@ class Repo:
         return self.tip(self.current_branch())
 
     def update_ref(self, branch, commit_hash, op="ref"):
-        """Move a branch tip. ALWAYS journaled — refs cannot move invisibly."""
+        """Move a branch tip. The ref move and its journal entry land in
+        ONE transaction — a crash can never leave a moved ref without its
+        journal entry (which verify would misread as tampering), or a
+        journal entry without its ref."""
         old = self.tip(branch)
-        with self.db:
+        with self.transaction():
             self.db.execute(
                 "INSERT INTO refs(name,hash) VALUES(?,?) "
                 "ON CONFLICT(name) DO UPDATE SET hash=excluded.hash",
                 (branch, commit_hash or ""))
-        self.journal(op, {"branch": branch, "old": old or "",
-                          "new": commit_hash or ""})
+            self.journal(op, {"branch": branch, "old": old or "",
+                              "new": commit_hash or ""})
 
     def remove_ref(self, branch):
-        """Delete a branch tip. ALWAYS journaled — refs cannot vanish invisibly."""
+        """Delete a branch tip. The deletion and its journal entry land in
+        ONE transaction — refs cannot vanish invisibly or half-vanish."""
         old = self.tip(branch)
-        with self.db:
+        with self.transaction():
             self.db.execute("DELETE FROM refs WHERE name=?", (branch,))
-        self.journal("branch-remove", {"branch": branch, "old": old or "",
-                                       "new": ""})
+            self.journal("branch-remove", {"branch": branch, "old": old or "",
+                                           "new": ""})
 
     # ---- journal: append-only, hash-chained audit log ----
     def chain_head(self):
@@ -265,7 +316,7 @@ class Repo:
         ts = int(time.time())
         body = canonical({"ts": ts, "op": op, "detail": detail, "prev": prev})
         link = sha256_hex(body)
-        with self.db:
+        with self.transaction():
             self.db.execute(
                 "INSERT INTO journal(ts,op,detail,prev,link) VALUES(?,?,?,?,?)",
                 (ts, op, canonical(detail).decode(), prev, link))
@@ -299,20 +350,30 @@ class Repo:
         return n, head
 
     # ---- stat cache (why status is instant on large trees) ----
-    def cached_hash(self, rel, size, mtime_ns):
+    # Keyed on size + mtime + ctime + inode. mtime alone is forgeable
+    # (touch -d, archive extraction, build tools) — a same-size edit with a
+    # restored mtime would slip past a (size, mtime) key. ctime is
+    # kernel-maintained and cannot be set backward from userspace, and the
+    # inode changes when editors replace a file, so both classes of edit
+    # force a cache miss. A miss only means the file is re-read: the cache
+    # fails toward correctness, never away from it.
+    def cached_hash(self, rel, size, mtime_ns, ctime_ns, ino):
         row = self.db.execute(
-            "SELECT hash FROM statcache WHERE path=? AND size=? AND mtime=?",
-            (rel, size, mtime_ns)).fetchone()
+            "SELECT hash FROM statcache WHERE path=? AND size=? AND mtime=? "
+            "AND ctime=? AND ino=?",
+            (rel, size, mtime_ns, ctime_ns, ino)).fetchone()
         return row[0] if row else None
 
     def remember(self, entries):
         if not entries:
             return
-        with self.db:
+        with self.transaction():
             self.db.executemany(
-                "INSERT INTO statcache(path,size,mtime,hash) VALUES(?,?,?,?) "
+                "INSERT INTO statcache(path,size,mtime,ctime,ino,hash) "
+                "VALUES(?,?,?,?,?,?) "
                 "ON CONFLICT(path) DO UPDATE SET size=excluded.size, "
-                "mtime=excluded.mtime, hash=excluded.hash", entries)
+                "mtime=excluded.mtime, ctime=excluded.ctime, "
+                "ino=excluded.ino, hash=excluded.hash", entries)
 
 def need_repo() -> Repo:
     root = find_repo()
@@ -396,7 +457,8 @@ def safe_name(name: str) -> bool:
     return bool(name) and "/" not in name and "\\" not in name \
         and "\0" not in name and not _BAD_NAME.match(name) and name != SB_DIR
 
-RACY_WINDOW_NS = 2_000_000_000   # files touched < 2s ago bypass the stat cache
+RACY_WINDOW_NS = 2_000_000_000   # files whose mtime OR ctime is < 2s old
+                                 # bypass the stat cache and are re-read
 
 def snapshot_worktree(repo: Repo, write=True):
     """Walk the working tree -> {rel: (mode, blob_hash)}.
@@ -421,15 +483,18 @@ def snapshot_worktree(repo: Repo, write=True):
             st = p.stat()
             mode = "100755" if os.access(p, os.X_OK) else "100644"
             h = None
-            if now_ns - st.st_mtime_ns > RACY_WINDOW_NS:
-                h = repo.cached_hash(rel, st.st_size, st.st_mtime_ns)
+            age_ns = min(now_ns - st.st_mtime_ns, now_ns - st.st_ctime_ns)
+            if age_ns > RACY_WINDOW_NS:
+                h = repo.cached_hash(rel, st.st_size, st.st_mtime_ns,
+                                     st.st_ctime_ns, st.st_ino)
             if h is not None and (not write or repo.has(h)):
                 files[rel] = (mode, h)
                 continue
             data = p.read_bytes()
             h = repo.put("blob", data) if write else hash_obj("blob", data)
             files[rel] = (mode, h)
-            cache_updates.append((rel, st.st_size, st.st_mtime_ns, h))
+            cache_updates.append((rel, st.st_size, st.st_mtime_ns,
+                                  st.st_ctime_ns, st.st_ino, h))
     repo.remember(cache_updates)
     if symlinks and not write:      # the write pass repeats the walk; stay quiet
         print(dim(f"note: {symlinks} symlink(s) skipped (not tracked in v1)"))
@@ -782,11 +847,12 @@ def cmd_save(args):
     if not args.no_verify:
         if not run_stage(repo, "pre-save", work, from_worktree=True):
             die("pre-save tests failed — save blocked (--no-verify to override)")
-    work = snapshot_worktree(repo, write=True)          # now persist blobs
-    tree_hash = build_tree(repo, work)
-    parents = [head_c["hash"]] if head_c else []
-    h = make_commit(repo, tree_hash, parents, args.message)
-    repo.update_ref(repo.current_branch(), h, op="save")
+    with repo.transaction():        # the ENTIRE save is one atomic unit:
+        work = snapshot_worktree(repo, write=True)      # blobs,
+        tree_hash = build_tree(repo, work)              # tree,
+        parents = [head_c["hash"]] if head_c else []
+        h = make_commit(repo, tree_hash, parents, args.message)  # commit,
+        repo.update_ref(repo.current_branch(), h, op="save")     # ref + journal
     n = len(added) + len(modified) + len(deleted)
     print(f"{bold('saved')} {amber(short(h))} "
           f"{dim('on')} {bold(repo.current_branch())} {dim('·')} {dim(str(n) + ' file(s)')}")
@@ -871,8 +937,9 @@ def cmd_undo(args):
     checkout_tree(repo, read_tree(repo, parent["tree"]),
                   read_tree(repo, c["tree"]))
     msg = c["message"].splitlines()[0]
-    h = make_commit(repo, parent["tree"], [head], f"undo: {msg}")
-    repo.update_ref(repo.current_branch(), h, op="undo")
+    with repo.transaction():            # undo commit point: one atomic unit
+        h = make_commit(repo, parent["tree"], [head], f"undo: {msg}")
+        repo.update_ref(repo.current_branch(), h, op="undo")
     print(f"{bold('undone')} {dim('— created')} {amber(short(h))}")
     leaf(f'reverts "{msg}"  '
          + dim("(history preserved; sb undo again to redo)"))
@@ -967,8 +1034,9 @@ def cmd_restore(args):
     target_tree = read_tree(repo, c["tree"])     # every blob re-hash-verified
     cur_tree, _ = head_tree_files(repo)
     checkout_tree(repo, target_tree, cur_tree)
-    h = make_commit(repo, c["tree"], [head], f"restore: to {how}")
-    repo.update_ref(repo.current_branch(), h, op="restore")
+    with repo.transaction():            # restore commit point: one atomic unit
+        h = make_commit(repo, c["tree"], [head], f"restore: to {how}")
+        repo.update_ref(repo.current_branch(), h, op="restore")
     print(f"{bold('restored')} {dim('to')} {how} {dim('— created')} "
           f"{amber(short(h))}")
     leaf(dim("history preserved — nothing deleted; sb undo returns you"))
@@ -1020,8 +1088,9 @@ def cmd_switch(args):
     target_tree = (read_tree(repo, parse_commit(repo, target_commit)["tree"])
                    if target_commit else {})
     checkout_tree(repo, target_tree, cur_tree)
-    repo.set_meta("branch", args.target)
-    repo.journal("switch", {"to": args.target, "tip": target_commit or ""})
+    with repo.transaction():            # pointer + journal: one atomic unit
+        repo.set_meta("branch", args.target)
+        repo.journal("switch", {"to": args.target, "tip": target_commit or ""})
     print(f"{dim('switched to')} {bold(args.target)} {amber(short(target_commit))}")
 
 def find_merge_base(repo, a, b):
@@ -1094,10 +1163,11 @@ def cmd_merge(args):
             die("pre-merge tests failed on the merged tree — merge blocked\n"
                 "       (fix on a branch and re-merge, or --no-verify to override)")
     checkout_tree(repo, merged, ours_tree)
-    tree_hash = build_tree(repo, merged)
-    h = make_commit(repo, tree_hash, [ours_tip, theirs_tip],
-                    f"merge {args.branch} into {repo.current_branch()}")
-    repo.update_ref(repo.current_branch(), h, op="merge")
+    with repo.transaction():            # merge commit point: one atomic unit
+        tree_hash = build_tree(repo, merged)
+        h = make_commit(repo, tree_hash, [ours_tip, theirs_tip],
+                        f"merge {args.branch} into {repo.current_branch()}")
+        repo.update_ref(repo.current_branch(), h, op="merge")
     print(f"{bold('merged')} {args.branch} {dim('→')} {bold(repo.current_branch())} "
           f"{dim('as')} {amber(short(h))}")
     if auto_merged:
@@ -1274,6 +1344,40 @@ def _verify(repo, quiet=False, anchor=None):
         except (CorruptObject, KeyError) as e:
             flag("object", f"branch {b}: {e}")
 
+    # 1b. saves kept from removed branches. 'sb branch -r' promises the
+    #     history stays intact, so verify must keep checking it — otherwise
+    #     unreachable history could rot with no proactive detection.
+    reachable = len(seen_commits)
+    for (ch,) in repo.db.execute(
+            "SELECT hash FROM objects WHERE kind='commit'").fetchall():
+        if ch in seen_commits:
+            continue
+        try:
+            for c in walk_history(repo, ch):
+                if c["hash"] in seen_commits:
+                    continue
+                seen_commits.add(c["hash"])
+                objects += 1
+                check_tree(c["tree"])
+        except (CorruptObject, KeyError) as e:
+            flag("object", f"removed-branch save {short(ch)}: {e}")
+    unreachable = len(seen_commits) - reachable
+
+    # 1c. anything still untouched (orphaned blobs or trees left by an
+    #     interrupted operation) — re-hash those too. Every row in the
+    #     objects table gets checked; nothing stored escapes verification.
+    for h, kind in repo.db.execute("SELECT hash, kind FROM objects").fetchall():
+        if h in seen_commits or h in seen_trees or h in seen_blobs:
+            continue
+        objects += 1
+        if kind == "tree":
+            check_tree(h)
+            continue
+        try:
+            repo.get(h)
+        except CorruptObject as e:
+            flag("object", str(e))
+
     # 2. the journal hash chain, end to end
     chain_ok, head_link, n_entries = True, None, 0
     try:
@@ -1321,8 +1425,10 @@ def _verify(repo, quiet=False, anchor=None):
 
     if not quiet:
         cats = {c for c, _ in problems}
+        extra = (dim(f"  ({unreachable} save(s) kept from removed branches)")
+                 if unreachable else "")
         print(f"checked {bold(str(objects))} {dim('objects across')} "
-              f"{bold(str(len(seen_commits)))} {dim('save(s)')}")
+              f"{bold(str(len(seen_commits)))} {dim('save(s)')}" + extra)
         rows = ["content hashes  " + (red("CORRUPTION FOUND")
                 if "object" in cats else "all valid " + amber("\u2713")),
                 "journal chain   " + (f"{n_entries} entries linked " + amber("\u2713")
