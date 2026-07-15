@@ -62,13 +62,13 @@ Requirements: Python 3.9+ (standard library only — no pip, no dependencies).
 **Install system-wide** (all users, requires sudo):
 
 ```bash
-curl -L https://install.jts.gg/sandbox | sudo bash
+curl -sL install.jts.gg/sandbox | sudo bash
 ```
 
 **Install for your user only:**
 
 ```bash
-curl -L https://install.jts.gg/sandbox | bash
+curl -sL install.jts.gg/sandbox | bash
 ```
 
 Then confirm it worked:
@@ -176,11 +176,12 @@ Executable scripts in `sb-tests/pre-save/`, `sb-tests/pre-merge/`, and `sb-tests
 Every command follows the same grammar, so nothing needs memorizing:
 
 - **Positional arguments say *what*** — a message, a path, a branch, a version, a file. Order matters only among positionals.
-- **Options say *how*** — and every routine option has a short and a long form: `-k`/`--key`, `-f`/`--files-only`, `-n`/`--limit`, `-r`/`--remove`, `-a`/`--anchor`, `-l`/`--list`. Options may appear anywhere on the line, before or after positionals.
-- **The two safety overrides — `--allow-secrets` and `--no-verify` — have no short form on purpose.** Bypassing a gate is something you type out in full, never something a one-letter slip can do.
+- **Options say *how*** — and every routine option has a short and a long form: `-k`/`--key`, `-f`/`--files-only`, `-i`/`--ignore-dir`, `-n`/`--limit`, `-r`/`--remove`, `-a`/`--anchor`, `-l`/`--list`. Options may appear anywhere on the line, before or after positionals.
+- **The two safety overrides — `--allow-secrets` and `--no-verify` — have no short form on purpose.** Bypassing a gate is something you type out in full, never something a one-letter slip can do. (`-i` is deliberately *not* in this class: merging into a folder is a routine deployment action, not a gate bypass — the gate is that it never happens without the flag.)
 - **Pass-keys are always `-k <passkey>`** (long: `--key`) across `pack`, `unpack`, and `export`. The old positional pass-key forms (`sb pack KEY`, `sb unpack file KEY`) and the `--sbox` alias were removed in 1.0 — one way to say it, everywhere.
 - **Subactions are words**: `sb test list`, `sb test new`, `sb test guide`, `sb deploy list` (`-l`/`--list` also accepted).
 - **Placeholders are whole words**: `<passkey>`, `<version>`, `<destination>`, `<count>` — usage text never abbreviates.
+- **Mistakes get useful answers.** A wrong flag, a missing argument, or a typo'd command prints a one-line explanation in sb's own voice, the correct usage line for *that* command, and a pointer to `sb help` — never a raw parser dump. Argument mistakes exit `1` like every other usage error, and `-h` after any command shows the menu.
 
 Conventions: `<angle brackets>` are required, `[square brackets]` optional. All commands work from anywhere inside the repository. Colors appear only when output is a terminal, so piping to files or scripts is always clean.
 
@@ -259,7 +260,7 @@ A deploy is a *record*; to get the files of a deployed version back out, use `sb
 
 Materializes any version — a **deploy label** (`sb export rel-1`), a **branch name**, or a **save-hash prefix** from `sb log` — as plain files, with no `.sb` directory and executable bits preserved. Labels resolve to the most recent deploy record with that name; ambiguous hash prefixes are rejected with a count. The destination defaults to `<repo>-<version>/` and must be empty; your repository and working folder are untouched (export is read-only, and every blob it reads is re-hash-verified on the way out).
 
-With `-k <passkey>`, it instead produces an encrypted, files-only `.sbox` release artifact (default name `<repo>-<version>.sbox`) carrying the label, commit, and sealed-by metadata — ready to ship to a server and drop with `sb unpack <file.sbox> /path/to/production -k <passkey>` (files-only archives unpack as plain files automatically).
+With `-k <passkey>`, it instead produces an encrypted, files-only `.sbox` release artifact (default name `<repo>-<version>.sbox`) carrying the label, commit, and sealed-by metadata — ready to ship to a server and drop with `sb unpack <file.sbox> /path/to/production -k <passkey>` (files-only archives unpack as plain files automatically; redeploying over a previous drop takes `-i`, see `sb unpack`).
 
 ### `sb verify [-a <hash>]`
 
@@ -304,9 +305,11 @@ Seals the entire repository into a single encrypted `.sbox` archive (Section 10)
 
 With `-f` (long: `--files-only`), the archive holds just the current save's files — no history, no journal — for handing someone the code without the repository. Works fully offline; the encryption module is embedded in sb.
 
-### `sb unpack <file.sbox> [<destination>] -k <passkey> [-f]`
+### `sb unpack <file.sbox> [<destination>] -k <passkey> [-f] [-i]`
 
-Restores a `.sbox` archive into a fresh folder (default: the original repository name), recreating the store with private permissions and checking out its files (Section 10). Refuses to overwrite an existing repository. A wrong pass-key or an altered archive fails cleanly and writes nothing.
+Restores a `.sbox` archive into a fresh folder (default: the original repository name), recreating the store with private permissions and checking out its files (Section 10). **The destination must be fresh or empty**: if it already contains *anything* — an sb repository or just plain files — unpack refuses, so a mistyped path can never silently stomp a live directory. A wrong pass-key or an altered archive fails cleanly and writes nothing.
+
+With `-i` (long: `--ignore-dir`), it **merges into an existing, non-empty destination** instead: files at the same path are overwritten with the archive's version, and everything else in the folder is left untouched. This is the flag for redeploying a release over a previous drop, or restoring an archive on top of a folder that already has local extras you want to keep. When the destination holds an sb repository, `-i` replaces its store with the archive's (stale WAL sidecars are cleaned up so the swap is safe); run `sb verify` afterward as usual. There is no per-file backup — files the archive overwrites are gone, so point `-i` at the right folder.
 
 With `-f` (long: `--files-only`), writes only the native files — no `.sb` directory is created, so the output is a plain folder of code rather than a repository (the archive's history, if present, is read in a temporary area and never kept). Archives that were packed with `--files-only` unpack this way automatically.
 
@@ -502,7 +505,7 @@ unpacked my-project · 3 file(s)
   └─── verify it: cd my-project && sb verify
 ```
 
-Unpacking recreates `.sb/sandbox.db` in a **fresh** folder (it refuses to overwrite an existing repository), restores it with private `0600` permissions, and checks out the current branch's files into your working folder. **All history survives** — every save, every branch, the full journal chain — so the very first thing worth doing is `sb verify`, which will confirm the store, chain, and refs all still agree.
+Unpacking recreates `.sb/sandbox.db` in a **fresh or empty** folder — a destination that already contains anything is refused, whether it holds a repository or just files, so an unpack can never silently overwrite a live directory. To merge into a non-empty folder deliberately (redeploys, restoring over local extras), pass `-i`/`--ignore-dir`: matching paths are overwritten with the archive's version, everything else is kept. The store is restored with private `0600` permissions and the current branch's files are checked out into your working folder. **All history survives** — every save, every branch, the full journal chain — so the very first thing worth doing is `sb verify`, which will confirm the store, chain, and refs all still agree.
 
 ### What's inside a .sbox
 
@@ -604,11 +607,14 @@ sb deploy v1.4                     # gates + journaled record
 sb export v1.4 -k "release-key"    # -> myapp-v1.4.sbox (encrypted, files only)
 scp myapp-v1.4.sbox server:
 
-# on the server
+# on the server — first deploy into a fresh folder
 sb unpack myapp-v1.4.sbox /srv/www/myapp -k "release-key"
+
+# every deploy after that merges over the previous drop
+sb unpack myapp-v1.5.sbox /srv/www/myapp -k "release-key" -i
 ```
 
-The unpacked folder is exactly the deployed save's files — nothing else (a files-only archive never writes a `.sb` directory). Rolling back is `sb export <older-label>` and the same drop. (Orchestration — symlink flips, service restarts, blue/green — belongs to your pipeline on top; sb's job is making "exactly which files" a solved, verifiable question.)
+The unpacked folder is exactly the deployed save's files — nothing else (a files-only archive never writes a `.sb` directory). Without `-i`, unpack refuses any non-empty destination, so redeploys are explicit: `-i` overwrites the files the new release ships and leaves server-local extras (uploads, generated config) alone. Rolling back is `sb export <older-label>` and the same `-i` drop. (Orchestration — symlink flips, service restarts, blue/green — belongs to your pipeline on top; sb's job is making "exactly which files" a solved, verifiable question.)
 
 **Local rollback / side-by-side.** `sb export rel-3 ./compare` materializes any past version next to your working copy without switching branches or disturbing anything.
 
@@ -658,7 +664,7 @@ Inside test scripts, sb additionally exports `SB_STAGE`, `SB_BRANCH`, `SB_COMMIT
 | code | meaning |
 |---|---|
 | `0` | success |
-| `1` | usage or state error (not a repo, unsaved changes, unknown branch, corrupt object hit mid-operation, …) |
+| `1` | usage or state error (not a repo, unsaved changes, unknown branch, bad arguments, non-empty unpack destination, corrupt object hit mid-operation, …) |
 | `2` | a **gate** stopped you: secrets found, tests failed, merge conflicts, or `verify` found problems |
 | `130` | interrupted (Ctrl-C) |
 
@@ -695,13 +701,20 @@ No. No network code exists in sb — no telemetry, no phoning home, nothing.
 **Can I rename a branch or delete one?**
 Delete, yes: `sb branch <name> -r` removes the branch's pointer (journaled, never the current or last branch — its saves stay in history). Rename is not built in yet; today it's create-at-the-same-save + remove: `sb branch new-name && sb branch old-name -r` (from another branch).
 
+**Can `unpack -i` be undone?**
+No — `-i` overwrites files in place, with no per-file backup. Files the archive replaces are gone (files it doesn't ship are untouched). That's why the flag exists at all: without it, unpack refuses any non-empty destination, so overwriting is always a decision you typed, never an accident. If the destination folder matters, back it up (or make it an sb repo and save) before merging into it.
+
 ---
 
 ## 18. Troubleshooting
 
 **`error: not inside a sandbox repository`** — you're outside any folder containing `.sb/sandbox.db`; `cd` in, or `sb init`.
 
+**`error: sb <command>: unrecognized arguments: …` / `missing: …`** — the flag or argument doesn't exist for that command; the correct usage line is printed right below the error. `sb help` shows the full menu.
+
 **`error: you have unsaved changes`** — `switch`, `merge`, and `undo` refuse to run over uncommitted work, always. `sb save "wip"` (saves are cheap and undo is free), or `sb restore <path>` for changes you want gone.
+
+**`error: <folder> is not empty — unpack into a fresh folder`** (or **`<folder>/.sb (an sb repository) — …`**) — unpack never writes into a destination that already contains anything, repository or not. Pick a fresh folder, or — if you *mean* to overwrite matching files in place, e.g. redeploying a release — add `-i`/`--ignore-dir`. Matching paths are replaced with the archive's version; everything else in the folder is kept.
 
 **`save blocked — possible secrets detected`** — Section 7. Remove the secret, ignore the file, or `--allow-secrets` if you're sure.
 
@@ -728,6 +741,7 @@ Stated plainly, because a tool that hides its edges isn't trustworthy:
 - **Whole-file storage.** zlib-compressed but not delta-compressed; fine for code and documents, heavy for huge frequently-changing binaries.
 - **Conservative merges.** Adjacent-line edits and same-point insertions conflict rather than merge; and conflicts are resolved by reconciling on a branch, not via in-worktree conflict markers with a merge-in-progress state (an explicit simplicity trade — sb never leaves your worktree in a special mode).
 - **No branch rename, no per-save tags** yet (branch *removal* exists: `sb branch <name> -r`).
+- **`unpack -i` keeps no backup.** Merging into a folder overwrites matching files with no undo; snapshotting the destination first is on you (or the roadmap's automatic pre-merge folder snapshot).
 - **Anchors are manual.** Automatic anchoring (e.g., appending each anchor to a file on another volume) is roadmap.
 - **Single-writer.** Concurrent sb invocations are safe but serialized.
 
