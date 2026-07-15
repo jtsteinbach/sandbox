@@ -724,7 +724,6 @@ print("[{name}] checking", os.environ["SB_BRANCH"], "@", os.environ["SB_COMMIT"]
 # --- your checks here ---
 sys.exit(0)
 """
-
 # ------------------------------------------------------------ commands ------
 def cmd_init(args):
     root = Path(".").resolve()
@@ -1325,7 +1324,6 @@ def cmd_ignore(args):
         fh.write(args.pattern + "\n")
     print(f"ignoring {cyan(args.pattern)}")
     leaf(dim(".sbignore updated"))
-
 # ------------------------------------------------------- portable archive ---
 # 'sb pack' seals the entire repository (the single sandbox.db) plus a small
 # manifest into one encrypted .sbox file; 'sb unpack' reverses it. Encryption
@@ -1713,8 +1711,8 @@ def cmd_pack(args):
     ])
 
 def cmd_unpack(args):
-    # usage: sb unpack <file.sbox> [<destination>] -k <passkey> [-f]
-    usage = "usage:  sb unpack <file.sbox> [<destination>] -k <passkey>"
+    # usage: sb unpack <file.sbox> [<destination>] -k <passkey> [-f] [-i]
+    usage = "usage:  sb unpack <file.sbox> [<destination>] -k <passkey> [-f] [-i]"
     if not args.params:
         die(usage)
     if len(args.params) > 2:
@@ -1747,8 +1745,17 @@ def cmd_unpack(args):
             "their recorded hash")
     kind = manifest.get("payload", "repo")
     dest = Path(dest_name) if dest_name else Path(manifest.get("repo_name", "sandbox"))
-    if (dest / SB_DIR).exists():
-        die(f"{dest / SB_DIR} already exists — unpack into a fresh folder")
+    if dest.exists() and not dest.is_dir():
+        die(f"{dest} exists and is not a folder — choose another destination")
+    # ANY non-empty destination counts as merging — a plain folder of files
+    # deserves the same protection as an existing repository
+    merging = dest.is_dir() and any(dest.iterdir())
+    if merging and not args.ignore_dir:
+        what = (f"{dest / SB_DIR} (an sb repository)"
+                if (dest / SB_DIR).exists() else f"{dest} is not empty")
+        die(f"{what} — unpack into a fresh folder,\n"
+            "       or merge into this one deliberately with -i / --ignore-dir\n"
+            "       (matching files are overwritten; everything else is kept)")
     who = manifest.get("created_by", {})
     when = time.strftime("%Y-%m-%d %H:%M", time.localtime(manifest.get("created", 0)))
     files_only = args.files_only or kind == "files"
@@ -1775,6 +1782,13 @@ def cmd_unpack(args):
     else:
         (dest / SB_DIR).mkdir(parents=True, exist_ok=True)
         db_path = dest / SB_DIR / DB_NAME
+        if merging:
+            # replacing an existing store: drop any stale WAL/SHM sidecars so
+            # SQLite cannot pair old write-ahead pages with the new database
+            for side in ("-wal", "-shm"):
+                stale = db_path.with_name(DB_NAME + side)
+                if stale.exists():
+                    stale.unlink()
         db_path.write_bytes(body)
         try:
             os.chmod(db_path, 0o600)
@@ -1790,6 +1804,9 @@ def cmd_unpack(args):
     rows = [f"sealed by  {who.get('name','?')} <{who.get('email','?')}>  {dim('· ' + when)}",
             f"branch     {manifest.get('branch','main')} "
             + dim("· anchor ") + amber(manifest.get("chain_head","")[:16])]
+    if merging:
+        rows.append(dim("merged into the existing folder — matching files "
+                        "overwritten, others untouched"))
     if held:
         rows.append(dim(held))
     else:
@@ -1897,14 +1914,71 @@ def _share_parser(cmd):
     """Uniform parser for pack / unpack / export. Options may appear
     anywhere on the line (parse_intermixed_args), same as every other
     sb command; there are no legacy positional-key forms."""
-    sp = argparse.ArgumentParser(prog=f"sb {cmd}", add_help=False)
+    sp = SBParser(prog=f"sb {cmd}", add_help=False)
     sp.add_argument("params", nargs="*")
     sp.add_argument("-k", "--key", metavar="<passkey>")
     if cmd in ("pack", "unpack"):
         sp.add_argument("-f", "--files-only", action="store_true")
+    if cmd == "unpack":
+        sp.add_argument("-i", "--ignore-dir", action="store_true")
     return sp
-
 # ---------------------------------------------------------------- CLI -------
+# One usage line per command, shown when its arguments don't parse — so a
+# mistake teaches the correct form instead of dumping argparse's wall of text.
+USAGES = {
+    "sb":         "sb <command> [arguments]",
+    "sb save":    'sb save "<message>" [--allow-secrets] [--no-verify]',
+    "sb log":     "sb log [-n <count>]",
+    "sb diff":    "sb diff [<path>]",
+    "sb restore": "sb restore <path>",
+    "sb branch":  "sb branch [<name>] [-r]",
+    "sb switch":  "sb switch <branch>",
+    "sb merge":   "sb merge <branch> [--no-verify]",
+    "sb test":    "sb test [<stage> | guide | list | new <stage> <name>]",
+    "sb deploy":  "sb deploy [<label>] [-l] [--no-verify]",
+    "sb verify":  "sb verify [-a <hash>]",
+    "sb journal": "sb journal [-n <count>]",
+    "sb who":     "sb who [<name>] [<email>]",
+    "sb ignore":  "sb ignore <pattern>",
+    "sb pack":    "sb pack [<output>] -k <passkey> [-f]",
+    "sb unpack":  "sb unpack <file.sbox> [<destination>] -k <passkey> [-f] [-i]",
+    "sb export":  "sb export <version> [<destination>] [-k <passkey>]",
+}
+
+def _arg_error(prog, message):
+    """One voice for every argument failure: a single die() in the same
+    style as every other sb error — command context, the correct usage
+    line, and a pointer to the menu — never the raw usage dump."""
+    # asking for help is not an error — show the menu and leave happy
+    if "unrecognized arguments" in message and \
+            any(t in message.split() for t in ("-h", "--help")):
+        print(HELP)
+        sys.exit(0)
+    # a mistyped command gets a short, human answer, not a choice dump
+    m = re.search(r"invalid choice: '([^']*)'", message)
+    if m:
+        die(f"'{m.group(1)}' is not an sb command\n"
+            f"       see the full menu:  sb help")
+    # everything else: cleaned-up argparse message + the right usage line
+    message = message.replace(
+        "the following arguments are required:", "missing:")
+    lines = [f"{prog}: {message}"]
+    if prog in USAGES:
+        lines.append(f"       usage:  {USAGES[prog]}")
+    lines.append("       see the full menu:  sb help")
+    die("\n".join(lines))
+
+class SBParser(argparse.ArgumentParser):
+    """argparse that reports failures through _arg_error instead of the
+    stock usage dump."""
+
+    def __init__(self, *a, **kw):
+        kw.setdefault("add_help", False)
+        super().__init__(*a, **kw)
+
+    def error(self, message):
+        _arg_error(self.prog.strip(), message)
+
 CMD_W = 33           # width of the command column in the help menu
 def _row(cmd, desc, last=False):
     conn = amber("\u2514\u2500\u2500\u2500" if last else "\u251c\u2500\u2500\u2500")
@@ -1957,6 +2031,7 @@ HELP = f"""
 {_row('unpack <file> [<destination>]', 'restore a .sbox archive')}
 {_opt('-k, --key <passkey>', 'pass-key it was sealed with (required)')}
 {_opt('-f, --files-only', 'write just the files, no .sb directory')}
+{_opt('-i, --ignore-dir', 'merge into an existing folder, overwriting matches')}
 {_row('export <version> [<destination>]', 'files of a deploy, branch, or save', last=True)}
 {_opt('-k, --key <passkey>', 'write an encrypted .sbox instead of a folder', cont=False)}
 
@@ -1980,8 +2055,8 @@ def main(argv=None):
         args = _share_parser(argv[0]).parse_intermixed_args(argv[1:])
         args.cmd = argv[0]
     else:
-        p = argparse.ArgumentParser(prog="sb", add_help=False)
-        sub = p.add_subparsers(dest="cmd")
+        p = SBParser(prog="sb")
+        sub = p.add_subparsers(dest="cmd", parser_class=SBParser)
         sub.add_parser("init")
         sub.add_parser("status")
         sp = sub.add_parser("save"); sp.add_argument("message", nargs="?")
@@ -2009,7 +2084,12 @@ def main(argv=None):
         who = sub.add_parser("who"); who.add_argument("name", nargs="?")
         who.add_argument("email", nargs="?")
         gp = sub.add_parser("ignore"); gp.add_argument("pattern")
-        args = p.parse_args(argv)
+        # parse_known_args so leftovers can be blamed on the command the
+        # user actually typed ('sb log: ...'), not the bare 'sb' parser
+        args, extra = p.parse_known_args(argv)
+        if extra:
+            prog = f"sb {args.cmd}" if args.cmd else "sb"
+            _arg_error(prog, "unrecognized arguments: " + " ".join(extra))
     if args.cmd is None:
         print(HELP); return
     try:
