@@ -20,7 +20,6 @@ Object model (zlib-compressed rows in the objects table)
 Tables: meta, objects, refs, journal, statcache.
 """
 
-
 import sys, os, io, json, time, zlib, hashlib, fnmatch, difflib, re
 import argparse
 import sqlite3, subprocess, tempfile, getpass, shutil
@@ -546,7 +545,7 @@ def ensure_clean(repo):
     a, m, d = worktree_vs_tree(work, tree)
     if a or m or d:
         die("you have unsaved changes — run 'sb save' first (nothing is ever\n"
-            "       silently discarded), or 'sb restore <file>' to drop them")
+            "       silently discarded), or 'sb restore <path>' to drop them")
 
 # ------------------------------------------------------- three-way merge ----
 def _diff_regions(base, side):
@@ -755,13 +754,13 @@ def cmd_status(args):
     rows += [dim("modified  ") + p for p in modified]
     rows += [dim("deleted   ") + dim(p) for p in deleted]
     tree_print(rows)
-    print(dim(f"run 'sb save \"message\"' to snapshot "
+    print(dim(f"run 'sb save \"<message>\"' to snapshot "
               f"{len(added)+len(modified)+len(deleted)} change(s)"))
 
 def cmd_save(args):
     repo = need_repo()
     if not args.message:
-        die('a message is required:  sb save "what changed"')
+        die('a message is required:  sb save "<message>"')
     work = snapshot_worktree(repo, write=False)
     tree_files, head_c = head_tree_files(repo)
     added, modified, deleted = worktree_vs_tree(work, tree_files)
@@ -1008,9 +1007,8 @@ def cmd_merge(args):
         leaf(dim(f"{len(auto_merged)} file(s) auto-merged line by line"))
 
 TEST_GUIDE = f"""\
-{bold('setting up test scripts')}
-{amber(RULE)}
 
+{bold('setting up test scripts')}
 Tests are plain executable scripts inside {bold('sb-tests/<stage>/')} in your
 repo. Any language works — sb only cares about the {bold('exit code')}:
 exit {bold('0')} means pass, anything else means fail.
@@ -1024,7 +1022,7 @@ exit {bold('0')} means pass, anything else means fail.
   {amber('\u251c\u2500\u2500\u2500')} sb test new pre-save smoke     {dim('scaffold sb-tests/pre-save/smoke.sh')}
   {amber('\u251c\u2500\u2500\u2500')} $EDITOR sb-tests/pre-save/smoke.sh
   {amber('\u251c\u2500\u2500\u2500')} sb test                        {dim('run every stage now')}
-  {amber('\u2514\u2500\u2500\u2500')} sb save "msg"                  {dim('gates now run automatically')}
+  {amber('\u2514\u2500\u2500\u2500')} sb save "<message>"            {dim('gates now run automatically')}
 
 {amber('how they run')}
   {amber('\u251c\u2500\u2500\u2500')} each script runs in a {bold('pristine temp checkout')} of HEAD —
@@ -1085,7 +1083,7 @@ def cmd_test(args):
     sys.exit(0 if ok else 2)
 
 def cmd_deploy(args):
-    if args.label == "list":               # word form of --list, like 'sb test list'
+    if args.label == "list":               # word form of -l, like 'sb test list'
         args.list, args.label = True, None
     repo = need_repo()
     if args.list:
@@ -1127,7 +1125,7 @@ def cmd_deploy(args):
     print(f"{bold('deployed')} {amber(short(head))} {dim('as')} "
           f"{bold(args.label or 'deploy')}")
     leaf(dim("journaled · anchor ") + amber(link[:16])
-         + dim(f"  (list: sb deploy --list · get files: "
+         + dim(f"  (list: sb deploy -l · get files: "
                f"sb export {args.label or 'deploy'})"))
 
 def _verify(repo, quiet=False, anchor=None):
@@ -1240,7 +1238,7 @@ def _verify(repo, quiet=False, anchor=None):
                         + amber("\u2713"))
         if head_link:
             rows.append("anchor          " + amber(head_link[:16])
-                        + dim("  (save it · check later: sb verify --anchor)"))
+                        + dim("  (save it · check later: sb verify -a <hash>)"))
         tree_print(rows)
         for _, p in problems:
             print(red("  ! " + p))
@@ -1648,20 +1646,13 @@ def _untar_files(data: bytes, dest: Path) -> int:
 
 def cmd_pack(args):
     repo = need_repo()
-    # canonical: sb pack [out] --key <PASS-KEY>; classic 'sb pack KEY [out]' works too
-    extra = list(args.params)
-    if args.key:
-        key = args.key
-        if len(extra) > 1:
-            die("too many arguments — with --key, give at most one output name")
-        out_name = extra[0] if extra else None
-    else:
-        if not extra:
-            die("a pass-key is required:  sb pack --key <PASS-KEY> [out.sbox]")
-        if len(extra) > 2:
-            die("too many arguments — usage: sb pack --key <PASS-KEY> [out.sbox]")
-        key = extra[0]
-        out_name = extra[1] if len(extra) > 1 else None
+    # usage: sb pack [<output>] -k <passkey> [-f]
+    if not args.key:
+        die("a pass-key is required:  sb pack [<output>] -k <passkey>")
+    if len(args.params) > 1:
+        die("too many arguments — usage: sb pack [<output>] -k <passkey>")
+    key = args.key
+    out_name = args.params[0] if args.params else None
     work = snapshot_worktree(repo, write=False)
     tree, _ = head_tree_files(repo)
     a, m, d = worktree_vs_tree(work, tree)
@@ -1718,29 +1709,21 @@ def cmd_pack(args):
         f"sealed   {name} <{email}>  "
         + dim(time.strftime('%Y-%m-%d %H:%M', time.localtime(manifest['created']))),
         dim("encrypted with vox · unpack: sb unpack "
-            + out.name + " --key <PASS-KEY>"),
+            + out.name + " -k <passkey>"),
     ])
 
 def cmd_unpack(args):
-    # canonical: sb unpack <file> [dest] --key <PASS-KEY>;
-    # classic 'sb unpack <file> KEY [dest]' works too
-    extra = list(args.params)
-    if not extra:
-        die("usage:  sb unpack <file.sbox> --key <PASS-KEY> [dest]")
-    path_name = extra.pop(0)
-    if args.key:
-        key = args.key
-        if len(extra) > 1:
-            die("too many arguments — with --key, give at most one destination")
-        dest_name = extra[0] if extra else None
-    else:
-        if not extra:
-            die("usage:  sb unpack <file.sbox> --key <PASS-KEY> [dest]")
-        if len(extra) > 2:
-            die("too many arguments — usage: sb unpack <file.sbox> "
-                "--key <PASS-KEY> [dest]")
-        key = extra[0]
-        dest_name = extra[1] if len(extra) > 1 else None
+    # usage: sb unpack <file.sbox> [<destination>] -k <passkey> [-f]
+    usage = "usage:  sb unpack <file.sbox> [<destination>] -k <passkey>"
+    if not args.params:
+        die(usage)
+    if len(args.params) > 2:
+        die("too many arguments — " + usage)
+    if not args.key:
+        die("a pass-key is required — " + usage)
+    key = args.key
+    path_name = args.params[0]
+    dest_name = args.params[1] if len(args.params) > 1 else None
     src = Path(path_name)
     if not src.is_file():
         die(f"no such file: {src}")
@@ -1836,17 +1819,18 @@ def _resolve_version(repo, what):
         if len(rows) > 1:
             die(f"'{what}' matches {len(rows)} saves — give more characters")
     die(f"nothing named '{what}' — not a deploy label, branch, or save hash\n"
-        f"       (see labels: sb deploy --list · see saves: sb log)")
+        f"       (see labels: sb deploy -l · see saves: sb log)")
 
 def cmd_export(args):
     repo = need_repo()
-    extra = list(args.params)
-    if not extra:
-        die("usage:  sb export <label|branch|hash> [dest] [--key PASS-KEY]")
-    if len(extra) > 2:
-        die("too many arguments — usage: sb export <version> [dest] "
-            "[--key PASS-KEY]")
-    what, dest_name = extra[0], (extra[1] if len(extra) > 1 else None)
+    # usage: sb export <version> [<destination>] [-k <passkey>]
+    usage = "usage:  sb export <version> [<destination>] [-k <passkey>]"
+    if not args.params:
+        die(usage)
+    if len(args.params) > 2:
+        die("too many arguments — " + usage)
+    what = args.params[0]
+    dest_name = args.params[1] if len(args.params) > 1 else None
     commit_hash, how = _resolve_version(repo, what)
     c = parse_commit(repo, commit_hash)
     tree = read_tree(repo, c["tree"])
@@ -1854,11 +1838,10 @@ def cmd_export(args):
         die(f"{how} contains no files")
     name, email = author()
 
-    key = args.key or (args.sbox or None)
-    sbox_mode = args.key is not None or args.sbox is not None
-    if sbox_mode:
+    if args.key is not None:                    # encrypted .sbox export
+        key = args.key
         if not key:
-            die("a pass-key is required:  sb export <version> --key <PASS-KEY>")
+            die("a pass-key is required:  sb export <version> -k <passkey>")
         vox = load_vox()
         body = _tar_tree(repo, tree)
         manifest = {
@@ -1894,8 +1877,8 @@ def cmd_export(args):
         tree_print([
             f"version  {how} {dim('·')} {amber(short(commit_hash))}",
             f"holds    files only · {len(tree)} file(s), no history",
-            dim(f"deploy it: sb unpack {out.name} --key <PASS-KEY> "
-                f"/path/to/production --files-only"),
+            dim(f"deploy it: sb unpack {out.name} /path/to/production "
+                f"-k <passkey>"),
         ])
         return
 
@@ -1910,46 +1893,28 @@ def cmd_export(args):
         dim("plain files, no .sb — the repository stays where it is"),
     ])
 
-def _parse_share_args(cmd, tokens):
-    """Order-independent parsing for pack/unpack/export: flags may appear
-    anywhere; everything else stays a positional, in the order given."""
-    params, key, sbox, files_only = [], None, None, False
-    i = 0
-    while i < len(tokens):
-        t = tokens[i]
-        if t in ("-k", "--key"):
-            i += 1
-            if i >= len(tokens):
-                die(f"{t} needs a value:  sb {cmd} ... {t} <PASS-KEY>")
-            key = tokens[i]
-        elif t.startswith("--key="):
-            key = t[len("--key="):]
-        elif cmd == "export" and t == "--sbox":            # legacy alias
-            if i + 1 < len(tokens) and not tokens[i + 1].startswith("-"):
-                i += 1
-                sbox = tokens[i]
-            else:
-                sbox = ""
-        elif cmd == "export" and t.startswith("--sbox="):
-            sbox = t[len("--sbox="):]
-        elif t == "--files-only":
-            files_only = True
-        elif t.startswith("-") and len(t) > 1:
-            die(f"unknown option '{t}' for sb {cmd}")
-        else:
-            params.append(t)
-        i += 1
-    return argparse.Namespace(cmd=cmd, params=params, key=key, sbox=sbox,
-                              files_only=files_only)
+def _share_parser(cmd):
+    """Uniform parser for pack / unpack / export. Options may appear
+    anywhere on the line (parse_intermixed_args), same as every other
+    sb command; there are no legacy positional-key forms."""
+    sp = argparse.ArgumentParser(prog=f"sb {cmd}", add_help=False)
+    sp.add_argument("params", nargs="*")
+    sp.add_argument("-k", "--key", metavar="<passkey>")
+    if cmd in ("pack", "unpack"):
+        sp.add_argument("-f", "--files-only", action="store_true")
+    return sp
 
 # ---------------------------------------------------------------- CLI -------
+CMD_W = 33           # width of the command column in the help menu
 def _row(cmd, desc, last=False):
     conn = amber("\u2514\u2500\u2500\u2500" if last else "\u251c\u2500\u2500\u2500")
-    return f"  {conn} {cmd.ljust(22)}{dim(desc)}"
+    return f"  {conn} {cmd.ljust(CMD_W)}{dim(desc)}"
 
-def _sub(text, cont=True):
+def _opt(flag, desc, cont=True):
+    """An option line, indented beneath its command — visually subordinate,
+    never mistakable for a command of its own."""
     bar = amber("\u2502") if cont else " "
-    return f"  {bar}      {dim(text)}"
+    return f"  {bar}       {dim(flag.ljust(CMD_W - 3))}{dim(desc)}"
 
 HELP = f"""
   {bold('sandbox (sb)')}   {dim('version ' + VERSION)}
@@ -1958,37 +1923,48 @@ HELP = f"""
 {amber('work')}
 {_row('init', 'start tracking this folder')}
 {_row('status', 'what changed since the last save')}
-{_row('save "msg"', 'snapshot everything')}
-{_row('log [-n N]', 'history of saves')}
-{_row('diff [path]', 'line-by-line changes')}
+{_row('save "<message>"', 'snapshot everything')}
+{_opt('--allow-secrets', 'override the secret scan and save anyway')}
+{_opt('--no-verify', 'skip the pre-save tests')}
+{_row('log', 'history of saves, newest first')}
+{_opt('-n, --limit <count>', 'show only the newest <count> saves')}
+{_row('diff [<path>]', 'line-by-line changes, all files or one path')}
 {_row('undo', 'revert the last save, keeping history')}
 {_row('restore <path>', 'bring a file or folder back', last=True)}
 
 {amber('branches')}
-{_row('branch [name] [-r]', 'list, create, or remove branches')}
+{_row('branch [<name>]', 'list branches, or create one named <name>')}
+{_opt('-r, --remove', 'remove branch <name> instead of creating it')}
 {_row('switch <branch>', 'move between branches')}
 {_row('merge <branch>', 'bring <branch> into the current one', last=True)}
+{_opt('--no-verify', 'skip the pre-merge tests', cont=False)}
 
 {amber('quality')}
+{_row('test [<stage>]', 'run test gates in a clean checkout')}
 {_row('test guide', 'how to set up test scripts')}
-{_row('test [stage]', 'run test gates in a clean checkout')}
-{_row('test new <s> <n>', 'scaffold a test script')}
+{_row('test new <stage> <name>', 'scaffold a test script')}
 {_row('test list', 'show discovered tests')}
-{_row('deploy [label]', 'verify + test + record a release')}
-{_row('verify [--anchor H]', 're-check objects and the journal', last=True)}
+{_row('deploy [<label>]', 'verify + test + record a release')}
+{_opt('-l, --list', 'show recorded deployments')}
+{_opt('--no-verify', 'record the deploy even if tests fail')}
+{_row('verify', 're-check objects, journal, and branch tips', last=True)}
+{_opt('-a, --anchor <hash>', 'also confirm a saved anchor is in the chain', cont=False)}
 
 {amber('share')}
-{_row('pack [out] --key K', 'seal the repo into an encrypted .sbox')}
-{_sub('--files-only — seal saved files without history')}
-{_row('unpack <file> --key K', 'restore a .sbox into a folder')}
-{_sub('--files-only — write just the files, no .sb dir')}
-{_row('export <ver> [dest]', 'files of a deploy, branch, or save', last=True)}
-{_sub('--key K — as an encrypted .sbox instead', cont=False)}
+{_row('pack [<output>]', 'seal the repo into an encrypted .sbox')}
+{_opt('-k, --key <passkey>', 'pass-key to encrypt with (required)')}
+{_opt('-f, --files-only', 'seal only the saved files, no history')}
+{_row('unpack <file> [<destination>]', 'restore a .sbox archive')}
+{_opt('-k, --key <passkey>', 'pass-key it was sealed with (required)')}
+{_opt('-f, --files-only', 'write just the files, no .sb directory')}
+{_row('export <version> [<destination>]', 'files of a deploy, branch, or save', last=True)}
+{_opt('-k, --key <passkey>', 'write an encrypted .sbox instead of a folder', cont=False)}
 
 {amber('repository')}
-{_row('journal [-n N]', 'log of every operation')}
+{_row('journal', 'log of every operation')}
+{_opt('-n, --limit <count>', 'show only the newest <count> entries')}
 {_row('info', 'stats and chain head')}
-{_row('who [name] [email]', 'how saves are attributed')}
+{_row('who [<name>] [<email>]', 'set or show how saves are attributed')}
 {_row('ignore <pattern>', 'add a .sbignore pattern', last=True)}
 """
 
@@ -1998,44 +1974,41 @@ def main(argv=None):
         print(HELP); return
     if argv[0] in ("-V", "--version", "version"):
         print(f"sb {VERSION} · {AUTHOR}"); return
-    p = argparse.ArgumentParser(prog="sb", add_help=False)
-    sub = p.add_subparsers(dest="cmd")
-    sub.add_parser("init")
-    sub.add_parser("status")
-    sp = sub.add_parser("save"); sp.add_argument("message", nargs="?")
-    sp.add_argument("--allow-secrets", action="store_true")
-    sp.add_argument("--no-verify", action="store_true")
-    lp = sub.add_parser("log"); lp.add_argument("-n", "--limit", type=int, default=0)
-    dp = sub.add_parser("diff"); dp.add_argument("path", nargs="?")
-    sub.add_parser("undo")
-    rp = sub.add_parser("restore"); rp.add_argument("path")
-    bp = sub.add_parser("branch"); bp.add_argument("name", nargs="?")
-    bp.add_argument("-r", "--remove", action="store_true")
-    wp = sub.add_parser("switch"); wp.add_argument("target")
-    mp = sub.add_parser("merge"); mp.add_argument("branch")
-    mp.add_argument("--no-verify", action="store_true")
-    tp = sub.add_parser("test"); tp.add_argument("args", nargs="*")
-    dpl = sub.add_parser("deploy"); dpl.add_argument("label", nargs="?")
-    dpl.add_argument("--list", action="store_true")
-    dpl.add_argument("--no-verify", action="store_true")
-    vp = sub.add_parser("verify"); vp.add_argument("--anchor")
-    jp = sub.add_parser("journal"); jp.add_argument("-n", "--limit", type=int, default=0)
-    sub.add_parser("info")
-    who = sub.add_parser("who"); who.add_argument("name", nargs="?")
-    who.add_argument("email", nargs="?")
-    gp = sub.add_parser("ignore"); gp.add_argument("pattern")
-    pk = sub.add_parser("pack"); pk.add_argument("params", nargs="*")
-    pk.add_argument("-k", "--key", metavar="PASS-KEY")
-    pk.add_argument("--files-only", action="store_true")
-    up = sub.add_parser("unpack"); up.add_argument("params", nargs="*")
-    up.add_argument("-k", "--key", metavar="PASS-KEY")
-    up.add_argument("--files-only", action="store_true")
-    ex = sub.add_parser("export"); ex.add_argument("params", nargs="*")
-    ex.add_argument("-k", "--key", metavar="PASS-KEY")
-    ex.add_argument("--sbox", nargs="?", const="", metavar="PASS-KEY")
-    if argv and argv[0] in ("pack", "unpack", "export"):
-        args = _parse_share_args(argv[0], argv[1:])
+    if argv[0] in ("pack", "unpack", "export"):
+        # parse_intermixed_args lets options sit anywhere among positionals,
+        # e.g. 'sb unpack backup.sbox -k KEY restored'
+        args = _share_parser(argv[0]).parse_intermixed_args(argv[1:])
+        args.cmd = argv[0]
     else:
+        p = argparse.ArgumentParser(prog="sb", add_help=False)
+        sub = p.add_subparsers(dest="cmd")
+        sub.add_parser("init")
+        sub.add_parser("status")
+        sp = sub.add_parser("save"); sp.add_argument("message", nargs="?")
+        sp.add_argument("--allow-secrets", action="store_true")
+        sp.add_argument("--no-verify", action="store_true")
+        lp = sub.add_parser("log")
+        lp.add_argument("-n", "--limit", type=int, default=0, metavar="<count>")
+        dp = sub.add_parser("diff"); dp.add_argument("path", nargs="?")
+        sub.add_parser("undo")
+        rp = sub.add_parser("restore"); rp.add_argument("path")
+        bp = sub.add_parser("branch"); bp.add_argument("name", nargs="?")
+        bp.add_argument("-r", "--remove", action="store_true")
+        wp = sub.add_parser("switch"); wp.add_argument("target")
+        mp = sub.add_parser("merge"); mp.add_argument("branch")
+        mp.add_argument("--no-verify", action="store_true")
+        tp = sub.add_parser("test"); tp.add_argument("args", nargs="*")
+        dpl = sub.add_parser("deploy"); dpl.add_argument("label", nargs="?")
+        dpl.add_argument("-l", "--list", action="store_true")
+        dpl.add_argument("--no-verify", action="store_true")
+        vp = sub.add_parser("verify")
+        vp.add_argument("-a", "--anchor", metavar="<hash>")
+        jp = sub.add_parser("journal")
+        jp.add_argument("-n", "--limit", type=int, default=0, metavar="<count>")
+        sub.add_parser("info")
+        who = sub.add_parser("who"); who.add_argument("name", nargs="?")
+        who.add_argument("email", nargs="?")
+        gp = sub.add_parser("ignore"); gp.add_argument("pattern")
         args = p.parse_args(argv)
     if args.cmd is None:
         print(HELP); return
