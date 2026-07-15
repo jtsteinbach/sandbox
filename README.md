@@ -62,13 +62,13 @@ Requirements: Python 3.9+ (standard library only — no pip, no dependencies).
 **Install system-wide** (all users, requires sudo):
 
 ```bash
-curl -sL install.jts.gg/sandbox | sudo bash
+curl -L https://install.jts.gg/sandbox | sudo bash
 ```
 
 **Install for your user only:**
 
 ```bash
-curl -sL install.jts.gg/sandbox | bash
+curl -L https://install.jts.gg/sandbox | bash
 ```
 
 Then confirm it worked:
@@ -121,8 +121,8 @@ sb verify                        # re-hash every object, check the journal chain
 sb journal                       # the tamper-evident log of everything sb ever did
 
 # move it somewhere safe
-sb pack "a-strong-pass-key"      # seal the whole repo into an encrypted .sbox
-sb unpack my-project.sbox "a-strong-pass-key"   # restore it on another machine
+sb pack --key "a-strong-pass-key"    # seal the whole repo into an encrypted .sbox
+sb unpack my-project.sbox --key "a-strong-pass-key"   # restore on another machine
 ```
 
 That's 90% of daily use. The remaining 10% — test gates, deployments, anchors — is below.
@@ -173,6 +173,14 @@ Executable scripts in `sb-tests/pre-save/`, `sb-tests/pre-merge/`, and `sb-tests
 
 ## 5. Command reference
 
+Every command follows the same grammar, so nothing needs memorizing:
+
+- **Positional arguments say *what*** — a message, a path, a branch, a version, a file. Order matters only among positionals.
+- **Flags say *how*** — `--files-only`, `--no-verify`, `-n 5` — and may appear anywhere on the line.
+- **Pass-keys are always `--key <PASS-KEY>`** (short: `-k`) across `pack`, `unpack`, and `export`. The classic positional forms (`sb pack KEY`, `sb unpack file KEY`) still work.
+- **Subactions are words**: `sb test list`, `sb test new`, `sb test guide`, `sb deploy list` (`--list` also accepted).
+- **`-n N` limits lists** (`log`, `journal`); **`-r` removes** (`branch -r`).
+
 Conventions: `<angle brackets>` are required, `[square brackets]` optional. All commands work from anywhere inside the repository. Colors appear only when output is a terminal, so piping to files or scripts is always clean.
 
 ### `sb init`
@@ -208,9 +216,11 @@ Reverts the effect of the latest save **by creating a new save** whose content e
 
 Copies a file — or, if `path` is a folder, everything under it — out of the last save into your working folder, overwriting the working copy, with its saved permissions. This is the "I mangled this file, give me back the good one" command.
 
-### `sb branch [name]`
+### `sb branch [name] [-r]`
 
 With no argument, lists branches, marking the current one and showing each tip. With a name, creates a branch pointing at the current save. Branch names must be single path components (no `/`, no leading `-`).
+
+With `-r` (or `--remove`), deletes the named branch's *pointer* — never the current branch, and never the last one. The saves it pointed at stay in the object store and the journal untouched (removal is itself a journaled operation, so a branch deleted behind sb's back via direct SQL is still flagged by `verify`).
 
 ### `sb switch <branch>`
 
@@ -229,18 +239,26 @@ The merge algorithm is deliberately conservative: edits that touch adjacent line
 
 Before the merged result is committed, **pre-merge test gates** run against the *merged tree itself* — the thing that will actually exist afterward — so "both branches passed their tests" can never smuggle in a combination that doesn't.
 
-### `sb test [stage]` / `sb test new <stage> <name>` / `sb test list`
+### `sb test [stage]` / `sb test new <stage> <name>` / `sb test list` / `sb test guide`
 
-Run gates manually against your current working tree (all stages, or one of `pre-save`, `pre-merge`, `pre-deploy`), scaffold a new test script from a template, or list discovered tests. Section 6 has the full guide.
+Run gates manually against your current working tree (all stages, or one of `pre-save`, `pre-merge`, `pre-deploy`), scaffold a new test script from a template, or list discovered tests. `sb test guide` prints a self-contained walkthrough of the whole system — stages, scaffolding, how scripts run, environment variables, and an example script — right in the terminal. Section 6 has the long-form version.
 
-### `sb deploy [label] [--list] [--no-verify]`
+### `sb deploy [label]` / `sb deploy list` / `--no-verify`
 
 Marks the current save as deployed, behind two gates:
 
 1. **Full store verification** — the entire `sb verify` battery. sb refuses to deploy from a damaged or tampered store.
 2. **Pre-deploy tests** on a clean checkout of the exact tree being deployed.
 
-Passing both writes a `deploy` entry into the hash-chained journal: what was deployed, from which branch, by whom, when. `sb deploy --list` shows all records and reports whether the chain that protects them still verifies. A deploy record is not a signature (Section 8), but falsifying one after the fact requires rewriting the journal chain — which `verify` and any noted anchor will expose.
+Passing both writes a `deploy` entry into the hash-chained journal: what was deployed, from which branch, by whom, when. `sb deploy list` (or `--list`) shows all records and reports whether the chain that protects them still verifies. A deploy record is not a signature (Section 8), but falsifying one after the fact requires rewriting the journal chain — which `verify` and any noted anchor will expose.
+
+A deploy is a *record*; to get the files of a deployed version back out, use `sb export`.
+
+### `sb export <label|branch|hash> [dest] [--key PASS-KEY]`
+
+Materializes any version — a **deploy label** (`sb export rel-1`), a **branch name**, or a **save-hash prefix** from `sb log` — as plain files, with no `.sb` directory and executable bits preserved. Labels resolve to the most recent deploy record with that name; ambiguous hash prefixes are rejected with a count. The destination defaults to `<repo>-<version>/` and must be empty; your repository and working folder are untouched (export is read-only, and every blob it reads is re-hash-verified on the way out).
+
+With `--key <PASS-KEY>`, it instead produces an encrypted, files-only `.sbox` release artifact (default name `<repo>-<version>.sbox`) carrying the label, commit, and sealed-by metadata — ready to ship to a server and drop with `sb unpack <file> --key <PASS-KEY> /path/to/production --files-only`. (`--sbox` remains as an alias.)
 
 ### `sb verify [--anchor HEX]`
 
@@ -279,13 +297,17 @@ Shows — or, with arguments, sets — how saves are attributed, stored in `~/.c
 
 Appends a pattern to `.sbignore` (Section 12).
 
-### `sb pack <PASS-KEY> [out.sbox]`
+### `sb pack [out.sbox] --key <PASS-KEY> [--files-only]`
 
-Seals the entire repository into a single encrypted `.sbox` archive (Section 10). The output defaults to `<foldername>.sbox`; a `.sbox` suffix is added if you omit it, and an existing file is never overwritten. Warns if you have unsaved changes, since pack seals *saved* history — save first to include them. Requires network access to fetch the encryption module.
+Seals the entire repository into a single encrypted `.sbox` archive (Section 10). The output defaults to `<foldername>.sbox`; a `.sbox` suffix is added if you omit it, and an existing file is never overwritten. Warns if you have unsaved changes, since pack seals *saved* history — save first to include them. (`sb pack <KEY> [out]` — the original positional form — still works.)
 
-### `sb unpack <path.sbox> <PASS-KEY> [dest]`
+With `--files-only`, the archive holds just the current save's files — no history, no journal — for handing someone the code without the repository. Works fully offline; the encryption module is embedded in sb.
 
-Restores a `.sbox` archive into a fresh folder (default: the original repository name), recreating the store with private permissions and checking out its files (Section 10). Refuses to overwrite an existing repository. A wrong pass-key or an altered archive fails cleanly and writes nothing.
+### `sb unpack <path.sbox> --key <PASS-KEY> [dest] [--files-only]`
+
+Restores a `.sbox` archive into a fresh folder (default: the original repository name), recreating the store with private permissions and checking out its files (Section 10). Refuses to overwrite an existing repository. A wrong pass-key or an altered archive fails cleanly and writes nothing. (`sb unpack <file> <KEY> [dest]` still works.)
+
+With `--files-only`, writes only the native files — no `.sb` directory is created, so the output is a plain folder of code rather than a repository (the archive's history, if present, is read in a temporary area and never kept). Archives that were packed with `--files-only` unpack this way automatically.
 
 ### `sb version`
 
@@ -451,22 +473,24 @@ This is the same trust move that transparency logs and blockchain checkpoints ma
 A sandbox repository is a single file (`.sb/sandbox.db`), which already makes it easy to move. But moving a raw database means moving your entire history *in the clear*. `sb pack` solves the last mile: it seals the whole repository into one **encrypted, self-describing archive** — a `.sbox` file — that is safe to email, drop in cloud storage, hand off on a USB stick, or archive for cold storage.
 
 ```bash
-sb pack "my-strong-pass-key"              # -> <foldername>.sbox
-sb pack "my-strong-pass-key" release.sbox # choose the output name
+sb pack --key "my-strong-pass-key"                # -> <foldername>.sbox
+sb pack release.sbox --key "my-strong-pass-key"   # choose the output name
 ```
 
 ```
 packed my-project.sbox · 45,576 bytes
   ├─── branch   main · anchor bd40a7878f681649
   ├─── sealed   Jordan <jt@noct.gg>  2026-07-14 08:35
-  └─── encrypted with vox · unpack: sb unpack my-project.sbox <PASS-KEY>
+  └─── encrypted with vox · unpack: sb unpack my-project.sbox --key <PASS-KEY>
 ```
 
-To restore it — on any machine with sb and network access — give the file and the same pass-key:
+Add `--files-only` to seal just the current save's files with no history — a clean way to hand someone the code without the repository.
+
+To restore it — on any machine with sb, fully offline — give the file and the same pass-key:
 
 ```bash
-sb unpack my-project.sbox "my-strong-pass-key"            # -> ./my-project/
-sb unpack my-project.sbox "my-strong-pass-key" dest-dir   # choose the folder
+sb unpack my-project.sbox --key "my-strong-pass-key"           # -> ./my-project/
+sb unpack my-project.sbox --key "my-strong-pass-key" dest-dir   # choose the folder
 ```
 
 ```
@@ -493,16 +517,18 @@ Every archive carries an encrypted **manifest** alongside the store, written fro
 
 Because the manifest lives *inside* the encrypted blob, an archive reveals nothing — not the author, not the branch, not the file names — to anyone without the pass-key. The only cleartext is a 5-byte header (`SBOX` + a format byte), which is also cryptographically bound to the ciphertext so it cannot be swapped without detection.
 
+Add `--files-only` to `unpack` to write only the native files with no `.sb` directory — useful when you just want the code out of an archive, not a working repository.
+
 ### The encryption: vox
 
-sb carries no cryptography of its own — that is a deliberate, load-bearing property of its security model (Section 8). So `pack` and `unpack` don't bundle a cipher; instead, at the moment you run them, sb fetches [**vox**](https://jts.gg/vox) — a small, single-file symmetric-encryption module — directly from its public source over HTTPS using only Python's standard library, and loads it in memory for that one operation. Nothing is written to disk, and sb's own footprint stays crypto-free and dependency-free.
+sb's *integrity* model uses no cryptographic keys — that remains a deliberate, load-bearing property (Section 8): nothing in save, merge, verify, the journal, or anchors depends on a secret. Archive *confidentiality* is different: `pack`/`unpack` use [**vox**](https://jts.gg/vox) (v1.7.3), a small, single-file symmetric-encryption module embedded verbatim inside sb. It is loaded into an in-memory module only for the duration of a pack or unpack — no separate file, no install step, no network — so every sb command works fully offline and sb stays a single dependency-free file.
 
 vox provides a misuse-resistant authenticated cipher (an SIV-style AEAD built on HMAC-SHA512, with PBKDF2-HMAC-SHA512 key stretching). Two consequences matter in practice:
 
 - **Wrong pass-key or a single altered byte → the archive will not open.** vox verifies authenticity *before* it decrypts, so a corrupted or tampered `.sbox` fails loudly rather than yielding garbage. sb adds a second belt-and-suspenders check by re-hashing the recovered store against `db_sha256`.
 - **Your pass-key is the only thing standing between the archive and its contents.** There is no recovery, no backdoor, and no key file. Choose a strong, high-entropy pass-key, and store it separately from the archive. A weak pass-key is a weak archive.
 
-> **A note on trust.** `pack`/`unpack` require network access to fetch vox, and you are trusting the code at its published URL at run time. That is the right trade for keeping sb itself crypto-free, but if you need fully offline or fully pinned operation, that is a conscious choice to make in your own environment. Everything else in sb — save, merge, verify, the journal, anchors — works with no network at all.
+> **A note on versions.** The embedded vox is pinned at the version sb shipped with — auditable in the source, immune to upstream changes at run time. Newer vox releases arrive with sb upgrades.
 
 ---
 
@@ -552,7 +578,7 @@ node_modules
 data/*.tmp
 ```
 
-`sb ignore <pattern>` appends for you. Always ignored regardless of `.sbignore`: `.sb` itself, `.git`, `node_modules`, `__pycache__`, `*.pyc`, `.DS_Store`. The `.sbignore` file itself is tracked, so ignore rules travel with branches like any other file.
+`sb ignore <pattern>` appends for you. Always ignored regardless of `.sbignore`: `.sb` itself, `*.sbox` archives (so packing inside your repo never snowballs archives into history), `.git`, `node_modules`, `__pycache__`, `*.pyc`, `.DS_Store`. The `.sbignore` file itself is tracked, so ignore rules travel with branches like any other file.
 
 Two behaviors worth knowing: ignoring a pattern does not remove already-saved files from history (delete them and save), and ignored files are invisible to `save`/`status` but never deleted by sb.
 
@@ -567,6 +593,22 @@ Two behaviors worth knowing: ignoring a pattern does not remove already-saved fi
 **"I broke it ten minutes ago."** `sb diff` to see the damage; `sb restore <file>` to reclaim one file from the last save; `sb undo` to revert the whole last save (non-destructively — you can `sb undo` again to change your mind).
 
 **Release with a paper trail.** Keep the real test suite at `sb-tests/pre-deploy/`. Ship with `sb deploy v1.4`: sb verifies the entire store, runs the suite against a clean checkout of exactly what's shipping, and journals the record. `sb deploy --list` is your release history, protected by the chain.
+
+**Deploy to a production filesystem.** The full path from repo to server, with encryption in transit and no repository ever touching production:
+
+```bash
+# on your machine
+sb deploy v1.4                       # gates + journaled record
+sb export v1.4 --key "release-key"   # -> myapp-v1.4.sbox (encrypted, files only)
+scp myapp-v1.4.sbox server:
+
+# on the server
+sb unpack myapp-v1.4.sbox --key "release-key" /srv/www/myapp --files-only
+```
+
+The unpacked folder is exactly the deployed save's files — nothing else. Rolling back is `sb export <older-label>` and the same drop. (Orchestration — symlink flips, service restarts, blue/green — belongs to your pipeline on top; sb's job is making "exactly which files" a solved, verifiable question.)
+
+**Local rollback / side-by-side.** `sb export rel-3 ./compare` materializes any past version next to your working copy without switching branches or disturbing anything.
 
 **Weekly trust ritual.** `sb verify`, copy the 16-character anchor next to the date somewhere off-machine. Thirty seconds; afterward, no rewrite of any history before that moment can escape `sb verify --anchor`.
 
@@ -680,7 +722,6 @@ Not yet — both are journal-visible operations on the roadmap. Today a branch y
 Stated plainly, because a tool that hides its edges isn't trustworthy:
 
 - **No live remotes yet.** Moving a repository between machines today is done with encrypted `.sbox` archives (`sb pack` / `sb unpack`, Section 10), which is deliberate and secure but manual. Continuous *sync* — designed journal-first, so the tamper-evidence story extends across machines rather than being bolted on — is the top roadmap item.
-- **`pack`/`unpack` need network access** to fetch the vox encryption module at run time (the trade for keeping sb itself crypto-free). Every other command works fully offline.
 - **No symlink tracking** (skipped with a note).
 - **Whole-file storage.** zlib-compressed but not delta-compressed; fine for code and documents, heavy for huge frequently-changing binaries.
 - **Conservative merges.** Adjacent-line edits and same-point insertions conflict rather than merge; and conflicts are resolved by reconciling on a branch, not via in-worktree conflict markers with a merge-in-progress state (an explicit simplicity trade — sb never leaves your worktree in a special mode).
