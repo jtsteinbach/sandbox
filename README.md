@@ -1,6 +1,7 @@
 # sandbox (sb)
 
 **Version 1.0** · [jts.gg/sandbox](https://jts.gg/sandbox)
+**License:** · [jts.gg/license](https://jts.gg/license)
 
 **Safe, honest version control for humans.** One file. One command vocabulary you can learn in five minutes. Zero dependencies beyond Python 3.9+. Zero cryptography libraries. Nothing is ever silently destroyed.
 
