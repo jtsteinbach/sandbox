@@ -2,7 +2,7 @@
 
 **Version 1.0** · [jts.gg/sandbox](https://jts.gg/sandbox)
 
-**Safe, honest version control for humans.** One file. One command vocabulary you can learn in five minutes. Zero dependencies beyond Python 3.9+. Zero cryptography libraries. Nothing is ever silently destroyed.
+**Safe and light version control.** One file. One command vocabulary you can learn in five minutes. Zero dependencies beyond Python 3.9+. Zero cryptography libraries. Nothing is ever silently destroyed.
 
 sb is not a git clone and does not use git's repository format. It keeps the two ideas git got right — content addressing and a Merkle DAG of snapshots — and replaces everything that makes git hostile to daily use: the staging area, detached HEADs, destructive commands, a repository made of thousands of fragile loose files, and error messages written for git's own developers.
 
