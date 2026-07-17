@@ -95,7 +95,7 @@ sb init                          # creates .sb/sandbox.db, branch "main"
 sb who "Ada" "ada@example.com"   # how your saves are attributed (once, globally)
 
 # work, then snapshot
-sb status                        # what changed? (renames detected)
+sb status                        # what changed?
 sb diff                          # show me line by line
 sb save "add login form"         # snapshot everything
 
