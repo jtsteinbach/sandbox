@@ -2,7 +2,7 @@
 """
 sandbox (sb) — version control in a single file.
 
-version   1.3
+version   1.4
 author    jts.gg/sandbox
 """
 
@@ -11,7 +11,7 @@ import argparse, contextlib
 import sqlite3, subprocess, tempfile, getpass, shutil
 from pathlib import Path
 
-VERSION = "1.3"
+VERSION = "1.4"
 AUTHOR = "jts.gg/sandbox"
 FORMAT_VERSION = 1
 SB_DIR = ".sb"
@@ -108,7 +108,10 @@ CREATE TABLE IF NOT EXISTS locks (
     owner  TEXT NOT NULL,
     email  TEXT NOT NULL,
     since  INTEGER NOT NULL,
-    base   TEXT NOT NULL DEFAULT ''
+    base   TEXT NOT NULL DEFAULT '',
+    held   TEXT NOT NULL DEFAULT '',
+    mode   TEXT NOT NULL DEFAULT '100644',
+    uid    INTEGER NOT NULL DEFAULT -1
 );
 """
 
@@ -214,13 +217,28 @@ class Repo:
             self.db.execute("DELETE FROM statcache")
 
     def _migrate_locks(self):
-        """Create the locks table on stores made before shared-lock support."""
+        """Create the locks table on stores made before shared-lock support,
+        and add the columns the 1.4 content-preserving lock model needs:
+        `held` (the exact content the holder is protecting), its file mode,
+        and the OS account the holder writes as. A pre-1.4 lock has an empty
+        `held`; the first enforcement pass adopts whatever is on disk rather
+        than guessing, so nothing is reverted on the strength of a blank."""
         with self.transaction():
             self.db.execute(
                 "CREATE TABLE IF NOT EXISTS locks ("
                 "path TEXT PRIMARY KEY, owner TEXT NOT NULL, "
                 "email TEXT NOT NULL, since INTEGER NOT NULL, "
                 "base TEXT NOT NULL DEFAULT '')")
+            cols = {r[1] for r in self.db.execute("PRAGMA table_info(locks)")}
+            if "held" not in cols:
+                self.db.execute("ALTER TABLE locks ADD COLUMN "
+                                "held TEXT NOT NULL DEFAULT ''")
+            if "mode" not in cols:
+                self.db.execute("ALTER TABLE locks ADD COLUMN "
+                                "mode TEXT NOT NULL DEFAULT '100644'")
+            if "uid" not in cols:
+                self.db.execute("ALTER TABLE locks ADD COLUMN "
+                                "uid INTEGER NOT NULL DEFAULT -1")
 
     # ---- meta ----
     def meta(self, key, default=None):
@@ -405,20 +423,44 @@ class Repo:
 
     # ---- shared-edit locks ----
     def locks(self):
-        """All current locks: {path: {owner, email, since, base}}."""
+        """All current locks:
+        {path: {owner, email, since, base, held, mode, uid}}.
+        `held` is the content hash the holder is protecting, LOCK_DELETED if
+        the holder removed the file, or "" for a pre-1.4 lock that predates
+        content tracking."""
         out = {}
-        for path, owner, email, since, base in self.db.execute(
-                "SELECT path,owner,email,since,base FROM locks"):
-            out[path] = {"owner": owner, "email": email,
-                         "since": since, "base": base}
+        for path, owner, email, since, base, held, mode, uid in self.db.execute(
+                "SELECT path,owner,email,since,base,held,mode,uid FROM locks"):
+            out[path] = {"owner": owner, "email": email, "since": since,
+                         "base": base, "held": held or "",
+                         "mode": mode or "100644",
+                         "uid": -1 if uid is None else int(uid)}
         return out
 
-    def set_lock(self, path, owner, email, base):
+    def set_lock(self, path, owner, email, base, held="", mode="100644",
+                 uid=-1):
         with self.transaction():
             self.db.execute(
-                "INSERT INTO locks(path,owner,email,since,base) "
-                "VALUES(?,?,?,?,?) ON CONFLICT(path) DO NOTHING",
-                (path, owner, email, int(time.time()), base or ""))
+                "INSERT INTO locks(path,owner,email,since,base,held,mode,uid) "
+                "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(path) DO NOTHING",
+                (path, owner, email, int(time.time()), base or "",
+                 held or "", mode or "100644",
+                 -1 if uid is None else int(uid)))
+
+    def update_lock_held(self, path, held, mode, touch=True):
+        """Move a lock's protected content forward — the holder edited the
+        file again. `touch` also restarts the expiry clock, so a lock times
+        out after an hour of NOT being worked on rather than an hour after
+        the first keystroke."""
+        with self.transaction():
+            if touch:
+                self.db.execute(
+                    "UPDATE locks SET held=?, mode=?, since=? WHERE path=?",
+                    (held or "", mode or "100644", int(time.time()), path))
+            else:
+                self.db.execute(
+                    "UPDATE locks SET held=?, mode=? WHERE path=?",
+                    (held or "", mode or "100644", path))
 
     def clear_locks(self, paths):
         if not paths:
@@ -562,6 +604,40 @@ def redact_secrets(data: bytes):
     if not findings:
         return data, [], True
     return "\n".join(lines).encode("utf-8"), findings, True
+
+def _redact_for_commit(repo, disk, paths, allow_secrets=False):
+    """The redaction pass every commit path shares. `disk` is a snapshot
+    whose blobs are already stored; `paths` are the ones about to be
+    committed. Returns (overrides, redacted, hard_blocked):
+      overrides    {rel: (mode, redacted_blob_hash)} to layer over `disk`
+      redacted     [(rel, findings)] for the report
+      hard_blocked [(rel, line, label)] files that hold a credential but
+                   cannot be rewritten faithfully — the caller must stop."""
+    over, redacted, hard = {}, [], []
+    if allow_secrets:
+        return over, redacted, hard
+    for rel in paths:
+        if rel not in disk:
+            continue                        # a deletion — nothing to scan
+        _, data = repo.get(disk[rel][1])
+        new_data, findings, safe = redact_secrets(data)
+        if not findings:
+            continue
+        if not safe:
+            hard.extend((rel, ln, lb) for ln, lb in findings)
+            continue
+        over[rel] = (disk[rel][0], repo.put("blob", new_data))
+        redacted.append((rel, findings))
+    return over, redacted, hard
+
+def _report_hard_blocked(hard_blocked, what="save"):
+    print(red(f"{what} blocked — secrets in files that cannot be "
+              "safely redacted (not clean UTF-8)"))
+    tree_print([red(f"{rel}:{ln}  {lb}") for rel, ln, lb in hard_blocked])
+    print(dim("history is permanent; remove the secret, add the "
+              "file\nto .sbignore, or override deliberately with "
+              "--allow-secrets"))
+    sys.exit(2)
 
 # ----------------------------------------------------------- trees ----------
 _BAD_NAME = re.compile(r"^\.?\.?$")   # "", ".", ".."
@@ -820,7 +896,9 @@ def _plan_checkout(target: dict, current: dict):
 
 def _checkout_preserving(repo, target, current, preserve):
     """checkout_tree, but never touch paths in `preserve` on disk (they hold
-    someone's in-progress edits during an --ignore merge)."""
+    someone's in-progress edits — a lock holder's version, or the files an
+    --ignore merge deliberately left alone)."""
+    preserve = set(preserve or ())
     t = {k: v for k, v in target.items() if k not in preserve}
     c = {k: v for k, v in current.items() if k not in preserve}
     checkout_tree(repo, t, c, preserve=preserve)
@@ -834,7 +912,7 @@ def checkout_tree(repo: Repo, target: dict, current: dict, preserve=None):
     transition is not a single atomic unit (see the durability notes in the
     README), but a crash leaves only ordinary unsaved changes, never a write
     outside the repo and never a torn object in the store. Paths in `preserve`
-    are never written or deleted (used by --ignore merges)."""
+    are never written or deleted (used by locks and --ignore merges)."""
     preserve = preserve or set()
     root_fd = os.open(str(repo.root), os.O_RDONLY | _O_DIRECTORY)
     try:
@@ -854,6 +932,8 @@ def checkout_tree(repo: Repo, target: dict, current: dict, preserve=None):
                     os.close(pfd)
         # Phase 1: deletions.
         for rel in deletions:
+            if rel in preserve:
+                continue
             pfd, leaf = _safe_parent_fd(root_fd, rel)
             try:
                 _remove_at(pfd, leaf)
@@ -861,6 +941,8 @@ def checkout_tree(repo: Repo, target: dict, current: dict, preserve=None):
                 os.close(pfd)
         # Phase 2: creations, parent-first.
         for rel in creations:
+            if rel in preserve:
+                continue
             mode, h = target[rel]
             pfd, leaf = _safe_parent_fd(root_fd, rel)
             try:
@@ -929,17 +1011,28 @@ def _prune_empty_dirs(repo: Repo):
 
 # --------------------------------------------------------- shared locking ---
 # Everyone works in ONE repository — one folder, one database — without
-# clone/push/pull. Coordination is by per-file locks:
+# clone/push/pull. Coordination is by per-file locks, and since 1.4 a lock
+# is about CONTENT, not permission:
 #
 #   * Editing a file auto-locks it to you (detected the next time any sb
-#     command scans the tree — sb has no daemon, so expiry and acquisition
-#     are evaluated lazily but deterministically).
-#   * A lock lasts until you 'sb save' or one hour passes; on expiry your
-#     edits are auto-saved (never lost), then auto-reverted — in history and
-#     on disk — so the shared tree returns to its pre-edit state. Bring the
-#     edits back any time with 'sb restore <auto-save hash>'.
-#   * While you hold a lock, only you may change or save that file. Others
-#     are refused unless they --force.
+#     command scans the tree — sb has no daemon, so acquisition, enforcement
+#     and expiry are evaluated lazily but deterministically).
+#   * While you hold a lock, YOUR bytes are the file. Anyone may open and
+#     edit it, but on the next sb command their version is put back to
+#     yours, on disk. Their rejected bytes are kept in the object store and
+#     named in the journal ('sb salvage <hash>' writes them out again), so
+#     the revert costs nothing permanently — it just refuses to let a second
+#     writer's copy become the version of record.
+#   * Only you can save that file. Everyone else's save skips it entirely,
+#     so a locked file can never be committed by anyone but its holder.
+#   * Your own later edits move the lock forward: each command that sees you
+#     changed the file again records the new content as the protected one and
+#     restarts the expiry clock.
+#   * A lock ends when you 'sb save' it, when you put the file back the way
+#     it was saved (nothing left to protect), or after an hour of inactivity.
+#     On expiry your edits are auto-saved (never lost), then auto-reverted —
+#     in history and on disk — so the shared tree returns to its pre-edit
+#     state. Bring them back with 'sb restore <auto-save hash>'.
 #
 # Shared operation is ALWAYS ON since 1.3 — there is no single-user mode
 # and no way to turn locking off. A repo used by one person simply never
@@ -952,9 +1045,10 @@ def _prune_empty_dirs(repo: Repo):
 # writes as their own OS account. So sb keeps a uid -> identity registry
 # (updated whenever anyone runs a command) and locks each found edit to
 # the account that owns the file. Where the signal doesn't exist —
-# deletions, Windows, uid-squashing network mounts — it falls back to the
-# invoking user, as before.
+# deletions, Windows, uid-squashing network mounts, or one login shared by
+# several sb identities — it falls back to the invoking user.
 LOCK_TTL = int(os.environ.get("SB_LOCK_TTL", "3600"))   # one hour, seconds
+LOCK_DELETED = "deleted"    # held-content marker: the holder removed the file
 
 def shared_mode(repo):
     # 1.3: shared operation is structural, not a setting. Kept as a function
@@ -1025,7 +1119,8 @@ def _only_redaction_differs(repo, tree_files, work, p):
     the save holds the redacted form of its secrets. Such a file is not
     abandoned work — committing it verbatim on lock expiry would leak the
     secret into history, and reverting it would destroy the user's live
-    credential on disk. Expiry leaves these files alone."""
+    credential on disk. Expiry leaves these files alone, and a lock on one
+    is released rather than enforced forever."""
     if p not in work or p not in tree_files:
         return False
     try:
@@ -1035,6 +1130,125 @@ def _only_redaction_differs(repo, tree_files, work, p):
     data2, findings, safe = redact_secrets(data)
     return (bool(findings) and safe
             and hash_obj("blob", data2) == tree_files[p][1])
+
+def foreign_locks(repo):
+    """Paths locked by someone other than me. These hold another person's
+    in-progress work: they are never overwritten by a checkout, never count
+    as my unsaved changes, and are never included in my saves."""
+    _, email = author()
+    return {p for p, l in repo.locks().items() if l["email"] != email}
+
+def _disk_state(repo, rel):
+    """(mode, hash, data, st) for a path, or (None, None, b'', st/None).
+    Anything that is not a plain file reads as absent."""
+    p = repo.root / rel
+    try:
+        st = os.lstat(p)
+    except OSError:
+        return None, None, b"", None
+    import stat as _stat
+    if not _stat.S_ISREG(st.st_mode):
+        return None, None, b"", st
+    try:
+        data = p.read_bytes()
+    except OSError:
+        return None, None, b"", st
+    mode = "100755" if os.access(p, os.X_OK) else "100644"
+    return mode, hash_obj("blob", data), data, st
+
+def _lock_actor(repo, lock, st):
+    """Which sb identity most likely made an on-disk change to a locked file.
+
+    The file's owner uid is the only hard signal a shared folder gives, so
+    it wins when it is usable: a file now owned by a different account was
+    written by that account. When the uid cannot separate the two people —
+    the same login used by several sb identities, a uid-squashing mount, a
+    deletion with nothing left to stat, or Windows — the best remaining
+    signal is who is running sb right now."""
+    _, me_email = author()
+    uid = getattr(st, "st_uid", None) if st is not None else None
+    if uid is not None and lock.get("uid", -1) >= 0:
+        if uid != lock["uid"]:
+            return _uid_identity(repo, uid)[1]        # another account
+        registered = _uid_identity(repo, uid)[1]
+        if registered == lock["email"] or me_email == lock["email"]:
+            return lock["email"]        # the account really is the holder's
+    return me_email
+
+def enforce_locks(repo, quiet=False):
+    """Keep every locked file equal to its holder's version.
+
+    For each lock the on-disk content is compared with the content the
+    holder is protecting:
+      * unchanged            -> nothing to do
+      * changed by the holder -> the protected content moves forward, and
+                                 the expiry clock restarts
+      * changed by anyone else -> the file is put back on disk to the
+                                 holder's version; the rejected bytes are
+                                 stored and journaled first, so they can be
+                                 recovered with 'sb salvage <hash>'
+    A lock whose protected content matches the last save is released: there
+    is nothing in progress left to protect. Returns True if anything on
+    disk was changed."""
+    locks = repo.locks()
+    if not locks:
+        return False
+    tree_files, _ = head_tree_files(repo)
+    restore, rejected, release, advanced = {}, [], [], []
+    for rel in sorted(locks):
+        l = locks[rel]
+        mode, cur_h, data, st = _disk_state(repo, rel)
+        cur = (mode, cur_h) if cur_h is not None else None
+        if not l["held"]:
+            # a pre-1.4 lock, recorded before content was tracked: adopt
+            # what is there now instead of guessing at a version
+            repo.update_lock_held(rel, cur_h or LOCK_DELETED,
+                                  mode or "100644", touch=False)
+            held = cur
+        else:
+            held = None if l["held"] == LOCK_DELETED else (l["mode"], l["held"])
+            if cur != held:
+                if _lock_actor(repo, l, st) == l["email"]:
+                    new_h = repo.put("blob", data) if cur else LOCK_DELETED
+                    repo.update_lock_held(rel, new_h, mode or "100644")
+                    held = cur
+                    advanced.append(rel)
+                else:
+                    if cur:
+                        rejected.append((rel, repo.put("blob", data),
+                                         l["owner"]))
+                    restore[rel] = held
+        committed = tree_files.get(rel)
+        if held == committed or (held is not None
+                                 and _only_redaction_differs(
+                                     repo, tree_files, {rel: held}, rel)):
+            release.append(rel)         # nothing in progress any more
+    if restore:
+        _restore_paths_on_disk(repo, restore)
+        with contextlib.suppress(sqlite3.Error):
+            repo.journal("lock-revert", {
+                "paths": sorted(restore),
+                "kept": {rel: h for rel, h, _ in rejected},
+                "by": author()[1]})
+        # always reported, never quiet: someone's bytes just left the disk
+        print(yellow("reverted ") + dim(f"{len(restore)} file(s) to their "
+              "lock holder's version — a locked file is theirs until they "
+              "save"))
+        rows = []
+        keep_h = dict((rel, h) for rel, h, _ in rejected)
+        for rel in sorted(restore):
+            note = f"held by {locks[rel]['owner']}"
+            if rel in keep_h:
+                note += f" · your version kept as {short(keep_h[rel])}"
+            rows.append(f"{cyan(rel)}  " + dim(note))
+        tree_print(rows)
+        leaf(dim("recover your version any time: sb salvage <hash> [<path>]"))
+    if release:
+        repo.clear_locks(release)
+    if advanced and not quiet:
+        tree_print([f"lock on {cyan(p)} " + dim("follows your latest edit")
+                    for p in sorted(advanced)])
+    return bool(restore)
 
 def process_lock_expiry(repo):
     """Handle expired locks. For each owner's abandoned edits:
@@ -1107,8 +1321,13 @@ def process_lock_expiry(repo):
 
 def acquire_locks_for_edits(repo, quiet=False):
     """Lock every modified file that isn't already locked — each to the
-    person who actually edited it. This is the 'editing auto-locks' rule,
-    applied lazily by whichever sb invocation scans the tree next.
+    person who actually edited it, recording the exact content that person
+    is protecting. This is the 'editing auto-locks' rule, applied lazily by
+    whichever sb invocation scans the tree next.
+
+    The snapshot is taken with write=True on purpose: a lock has to be able
+    to put its holder's version back, so those bytes must be in the store
+    before anyone else can overwrite the file.
 
     Attribution goes by the file's owner uid, not the invoking user: if Bob
     runs 'sb status' and finds Alice's unsaved edit, the lock is created in
@@ -1116,14 +1335,13 @@ def acquire_locks_for_edits(repo, quiet=False):
     has never run sb here). Deletions leave nothing to stat, and Windows has
     no owner uid — those fall back to the invoker.
 
-    A subtlety of a *shared working directory*: a file locked by someone else
-    will differ from the last commit because their unsaved edits sit on disk.
-    That is THEIR work, not mine — I neither lock nor am blocked by it. Only
-    files that differ from committed AND aren't already locked are claimed."""
+    A file already locked by someone else differs from the last commit
+    because their protected version sits on disk. That is THEIR work, not
+    mine — I neither lock it nor am blocked by it."""
     register_identity(repo)
     name, email = author()
     me_uid = _my_uid()
-    work = snapshot_worktree(repo, write=False)
+    work = snapshot_worktree(repo, write=True)
     tree_files, _ = head_tree_files(repo)
     a, m, d = worktree_vs_tree(work, tree_files)
     edited = set(a) | set(m) | set(d)
@@ -1147,18 +1365,32 @@ def acquire_locks_for_edits(repo, quiet=False):
         base = repo.head_commit() or ""
         if mine_new:
             for p in mine_new:
-                repo.set_lock(p, name, email, base)
+                mode, h = work.get(p, ("100644", None))
+                repo.set_lock(p, name, email, base, held=h or LOCK_DELETED,
+                              mode=mode,
+                              uid=-1 if me_uid is None else me_uid)
             if not quiet:
-                tree_print([f"locked {cyan(p)} " + dim("(yours until you save "
-                            "or 1h)") for p in sorted(mine_new)])
+                tree_print([f"locked {cyan(p)} " + dim("(your version wins "
+                            "until you save)") for p in sorted(mine_new)])
         for uid, paths in sorted(theirs.items()):
             o_name, o_email = _uid_identity(repo, uid)
             for p in sorted(paths):
-                repo.set_lock(p, o_name, o_email, base)
+                mode, h = work.get(p, ("100644", None))
+                repo.set_lock(p, o_name, o_email, base,
+                              held=h or LOCK_DELETED, mode=mode, uid=uid)
             if not quiet:
                 tree_print([f"locked {cyan(p)} to {bold(o_name)} "
                             + dim("(their on-disk edit)")
                             for p in sorted(paths)])
+
+def sync_locks(repo, quiet=False):
+    """The whole lock lifecycle, in the only order that keeps content
+    honest: put every locked file back to its holder's version, retire
+    abandoned locks, then claim whatever is newly edited. Every command
+    that reads or writes repository state runs this first."""
+    enforce_locks(repo, quiet=quiet)
+    process_lock_expiry(repo)
+    acquire_locks_for_edits(repo, quiet=quiet)
 
 def _ago(ts):
     s = max(0, int(time.time()) - ts)
@@ -1225,13 +1457,21 @@ def _commit_subset(repo, work, tree_files, head_c, subset, message,
                         extra=extra)
     return h
 
-def ensure_clean(repo):
+def ensure_clean(repo, extra_exempt=None):
+    """Refuse to run when the working tree holds changes an operation would
+    throw away. Files locked by other people are exempt: their in-progress
+    edits are supposed to be sitting there, every checkout preserves them,
+    and no operation of mine can commit or destroy them."""
+    exempt = foreign_locks(repo) | set(extra_exempt or ())
     work = snapshot_worktree(repo, write=False)
     tree, _ = head_tree_files(repo)
     a, m, d = worktree_vs_tree(work, tree)
-    if a or m or d:
+    dirty = sorted((set(a) | set(m) | set(d)) - exempt)
+    if dirty:
         die("you have unsaved changes — run 'sb save' first (nothing is ever\n"
-            "       silently discarded), or 'sb undo -p <path>' to drop them")
+            "       silently discarded), or 'sb undo -p <path>' to drop them\n"
+            "       (" + ", ".join(dirty[:5])
+            + (" …" if len(dirty) > 5 else "") + ")")
 
 # ------------------------------------------------------- three-way merge ----
 def _diff_regions(base, side):
@@ -1431,6 +1671,7 @@ print("[{name}] checking", os.environ["SB_BRANCH"], "@", os.environ["SB_COMMIT"]
 # --- your checks here ---
 sys.exit(0)
 """
+
 # ------------------------------------------------------------ commands ------
 def cmd_init(args):
     root = Path(".").resolve()
@@ -1446,7 +1687,7 @@ def cmd_init(args):
 
 def cmd_status(args):
     repo = need_repo()
-    process_lock_expiry(repo)
+    sync_locks(repo, quiet=True)
     work = snapshot_worktree(repo, write=False,
                              deep=getattr(args, "deep", False))
     tree, _ = head_tree_files(repo)
@@ -1455,36 +1696,40 @@ def cmd_status(args):
     print(f"on branch {bold(repo.current_branch())}"
           + (f" {dim('·')} head {amber(short(head))}" if head
              else dim("  (no saves yet)")))
-    acquire_locks_for_edits(repo, quiet=True)
     name, email = author()
     locks = repo.locks()
     if locks:
         rows = []
         for p in sorted(locks):
             l = locks[p]
-            who = (bold("you") if l["email"] == email
-                   else l["owner"])
+            mine = l["email"] == email
+            who = bold("you") if mine else l["owner"]
             rows.append(f"{cyan(p)}  " + dim(f"locked by {who} "
-                        + _ago(l["since"])))
+                        + _ago(l["since"])
+                        + ("" if mine else " · their version wins")))
         print(dim("locks:"))
         tree_print(rows)
     if not (added or modified or deleted):
         leaf("working tree clean " + dim("— nothing to save"))
         return
     renames, added_r, deleted_r = detect_renames(work, tree, added, deleted)
-    rows  = [dim("renamed   ") + dim(o) + dim(" → ") + p for o, p in renames]
-    rows += [dim("new       ") + p for p in added_r]
-    rows += [dim("modified  ") + p for p in modified]
-    rows += [dim("deleted   ") + dim(p) for p in deleted_r]
+    theirs = foreign_locks(repo)
+    def mark(p):
+        return p + (dim("  (theirs)") if p in theirs else "")
+    rows  = [dim("renamed   ") + dim(o) + dim(" → ") + mark(p) for o, p in renames]
+    rows += [dim("new       ") + mark(p) for p in added_r]
+    rows += [dim("modified  ") + mark(p) for p in modified]
+    rows += [dim("deleted   ") + dim(mark(p)) for p in deleted_r]
     tree_print(rows)
-    print(dim(f"run 'sb save \"<message>\"' to snapshot "
-              f"{len(added)+len(modified)+len(deleted)} change(s)"))
+    n_mine = len([p for p in (added + modified + deleted) if p not in theirs])
+    print(dim(f"run 'sb save \"<message>\"' to snapshot {n_mine} change(s) "
+              f"of yours"))
 
 def cmd_save(args):
     repo = need_repo()
     if not args.message:
         die('a message is required:  sb save "<message>"')
-    process_lock_expiry(repo)
+    sync_locks(repo, quiet=True)
     if not getattr(args, "global_force", False):
         _save_shared(repo, args)           # the normal path: your files only
         return
@@ -1508,27 +1753,12 @@ def cmd_save(args):
         # replaced with <REDACTED> in the blob that will be committed. The
         # file on disk is never rewritten. Files that contain secrets but
         # can't be rewritten faithfully (not clean UTF-8) still block.
-        work = dict(disk)                  # the candidate tree to commit
-        redacted, hard_blocked = [], []
-        if not args.allow_secrets:
-            for rel in added + modified:
-                _, data = repo.get(disk[rel][1])
-                new_data, findings, safe = redact_secrets(data)
-                if not findings:
-                    continue
-                if not safe:
-                    hard_blocked.extend((rel, ln, lb) for ln, lb in findings)
-                    continue
-                work[rel] = (disk[rel][0], repo.put("blob", new_data))
-                redacted.append((rel, findings))
+        over, redacted, hard_blocked = _redact_for_commit(
+            repo, disk, added + modified, args.allow_secrets)
         if hard_blocked:
-            print(red("save blocked — secrets in files that cannot be "
-                      "safely redacted (not clean UTF-8)"))
-            tree_print([red(f"{rel}:{ln}  {lb}") for rel, ln, lb in hard_blocked])
-            print(dim("history is permanent; remove the secret, add the "
-                      "file\nto .sbignore, or override deliberately with "
-                      "--allow-secrets"))
-            sys.exit(2)
+            _report_hard_blocked(hard_blocked)
+        work = dict(disk)                  # the candidate tree to commit
+        work.update(over)
         # redaction can make a "change" identical to what's already saved;
         # re-check so we don't create an empty save
         a2, m2, d2 = worktree_vs_tree(work, tree_files)
@@ -1587,6 +1817,9 @@ def _save_shared(repo, args):
     they hold locks on / have changed), leaving everyone else's in-progress
     work untouched in the commit. Releases the user's locks.
 
+    A file locked by somebody else is never included, whatever is on disk —
+    their lock means their version is the file, and only they can commit it.
+
     Consistency contract (same as the --global-force whole-tree path): the
     worktree is read ONCE into stored blobs; redaction, the secret check,
     the test gate, and the commit all operate on those exact blobs; and the
@@ -1594,7 +1827,6 @@ def _save_shared(repo, args):
     that drifted during testing aborts the save instead of smuggling
     unscanned, untested bytes into history."""
     name, email = author()
-    acquire_locks_for_edits(repo, quiet=True)   # lock anything newly edited
     with repo.transaction():
         # one transaction end to end: an abort at any point also rolls the
         # candidate blobs (redacted or not) back out of the object store
@@ -1609,35 +1841,22 @@ def _save_shared(repo, args):
         changed = [p for p in mine if disk.get(p) != tree_files.get(p)]
         if not changed:
             print(green("nothing of yours to save"))
+            held = sorted(p for p, l in locks.items() if l["email"] != email)
+            if held:
+                leaf(dim(f"{len(held)} file(s) belong to other people's "
+                         "locks: " + ", ".join(held[:4])
+                         + (" …" if len(held) > 4 else "")))
             return
         # redaction pass: recognized credentials are replaced with <REDACTED>
         # in the blob that will be committed; the file on disk is never
         # rewritten. Files with secrets that can't be rewritten faithfully
         # (not clean UTF-8) still block the save.
-        work = dict(disk)                  # the candidate content to commit
-        redacted, hard_blocked = [], []
-        if not args.allow_secrets:
-            for rel in changed:
-                if rel not in disk:
-                    continue               # a deletion — nothing to scan
-                _, data = repo.get(disk[rel][1])
-                new_data, findings, safe = redact_secrets(data)
-                if not findings:
-                    continue
-                if not safe:
-                    hard_blocked.extend((rel, ln, lb) for ln, lb in findings)
-                    continue
-                work[rel] = (disk[rel][0], repo.put("blob", new_data))
-                redacted.append((rel, findings))
+        over, redacted, hard_blocked = _redact_for_commit(
+            repo, disk, changed, args.allow_secrets)
         if hard_blocked:
-            print(red("save blocked — secrets in files that cannot be "
-                      "safely redacted (not clean UTF-8)"))
-            tree_print([red(f"{rel}:{ln}  {lb}")
-                        for rel, ln, lb in hard_blocked])
-            print(dim("history is permanent; remove the secret, add the "
-                      "file\nto .sbignore, or override deliberately with "
-                      "--allow-secrets"))
-            sys.exit(2)
+            _report_hard_blocked(hard_blocked)
+        work = dict(disk)                  # the candidate content to commit
+        work.update(over)
         # redaction can make a "change" identical to what's already saved
         # (the file's only difference was a secret already stored as
         # <REDACTED>); re-filter so we don't create an empty save
@@ -1733,11 +1952,14 @@ def cmd_diff(args):
     if not targets and not renames:
         print(dim("no differences"))
         return
+    theirs = foreign_locks(repo)
     for o, n in renames:
         print(amber(f"@@ {o} → {n}") + dim("  renamed (content identical)"))
     for rel in sorted(targets):
         old_b = repo.get(tree[rel][1])[1] if rel in tree else b""
         new_b = (repo.root / rel).read_bytes() if rel in work else b""
+        if rel in theirs:
+            print(amber(f"@@ {rel}") + dim("  (another user's locked edit)"))
         if b"\0" in old_b[:8000] or b"\0" in new_b[:8000]:
             print(amber(f"@@ {rel}") + dim(
                 f"  binary file differs ({len(old_b):,} → {len(new_b):,} bytes)"))
@@ -1761,6 +1983,8 @@ def cmd_undo(args):
     With -p <path>: bring just that file or folder back from the last
     save, overwriting the working copy — no new save is created."""
     repo = need_repo()
+    sync_locks(repo, quiet=True)
+    keep = foreign_locks(repo)
     if args.path:                       # targeted: un-mangle one path
         tree, _ = head_tree_files(repo)
         rel = args.path.rstrip("/")
@@ -1768,6 +1992,12 @@ def cmd_undo(args):
                   [p for p in tree if p.startswith(rel + "/")]
         if not matches:
             die(f"'{rel}' is not in the last save")
+        blocked = sorted(set(matches) & keep)
+        if blocked:
+            die("someone else holds a lock on "
+                + ", ".join(blocked[:4]) + (" …" if len(blocked) > 4 else "")
+                + "\n       their version is the file until they save it "
+                  "(see 'sb locks')")
         # write through the same no-follow, descriptor-relative path that
         # checkout uses — a symlinked parent or a symlink squatting on the
         # target name must never redirect the restore outside the repo
@@ -1787,6 +2017,7 @@ def cmd_undo(args):
                     os.close(pfd)
         finally:
             os.close(root_fd)
+        repo.clear_locks(matches)       # the edit is gone: so is its lock
         what = cyan(rel) if len(matches) == 1 else \
             f"{len(matches)} file(s) under {rel}/"
         print(f"brought back {what} from the last save")
@@ -1799,8 +2030,8 @@ def cmd_undo(args):
     if not c["parents"]:
         die("cannot undo the very first save")
     parent = parse_commit(repo, c["parents"][0])
-    checkout_tree(repo, read_tree(repo, parent["tree"]),
-                  read_tree(repo, c["tree"]))
+    _checkout_preserving(repo, read_tree(repo, parent["tree"]),
+                         read_tree(repo, c["tree"]), keep)
     msg = c["message"].splitlines()[0]
     with repo.transaction():            # commit point: one transaction
         h = make_commit(repo, parent["tree"], [head], f"undo: {msg}")
@@ -1887,6 +2118,7 @@ def cmd_restore(args):
     Like undo, but to any point: nothing is rewound or deleted, and
     running undo right after returns to the pre-restore state."""
     repo = need_repo()
+    sync_locks(repo, quiet=True)
     head = repo.head_commit()
     if not head:
         die("no saves yet — nothing to restore")
@@ -1898,13 +2130,62 @@ def cmd_restore(args):
         return
     target_tree = read_tree(repo, c["tree"])     # every blob re-hash-verified
     cur_tree, _ = head_tree_files(repo)
-    checkout_tree(repo, target_tree, cur_tree)
+    _checkout_preserving(repo, target_tree, cur_tree, foreign_locks(repo))
     with repo.transaction():            # commit point: one transaction
         h = make_commit(repo, c["tree"], [head], f"restore: to {how}")
         repo.update_ref(repo.current_branch(), h, op="restore", expect=head)
     print(f"{bold('restored')} {dim('to')} {how} {dim('— created')} "
           f"{amber(short(h))}")
     leaf(dim("history preserved — nothing deleted; sb undo returns you"))
+
+def _create_branch(repo, branch, head, allow_secrets=False):
+    """Create `branch` and give it an immediate first save of the working
+    folder, messaged "Initial branch creation".
+
+    A branch is therefore born with content: it can be switched to, tested,
+    and merged straight away, and there is no "save something first" step
+    and no branch that exists only as a name. Files another person holds a
+    lock on are taken from the last save instead of from disk — their
+    in-progress work is theirs to commit — and recognized credentials are
+    redacted exactly as a normal save redacts them. If the current branch
+    has never been saved, it is seeded with this same commit so both
+    branches start from one common first save (which is what makes an
+    immediate merge meaningful)."""
+    name, email = author()
+    keep = foreign_locks(repo)
+    seeded = None
+    with repo.transaction():
+        disk = snapshot_worktree(repo, write=True)
+        base_tree = (read_tree(repo, parse_commit(repo, head)["tree"])
+                     if head else {})
+        work = dict(disk)
+        for p in sorted(keep):
+            if p in base_tree:
+                work[p] = base_tree[p]      # their lock: use the saved version
+            else:
+                work.pop(p, None)           # their unsaved new file: not mine
+        over, redacted, hard = _redact_for_commit(repo, work, sorted(work),
+                                                  allow_secrets)
+        if hard:
+            _report_hard_blocked(hard, what="branch")
+        work.update(over)
+        tree_hash = build_tree(repo, work)
+        c = {"tree": tree_hash, "parents": [head] if head else [],
+             "author": name, "email": email, "time": int(time.time()),
+             "message": "Initial branch creation"}
+        h = repo.put("commit", canonical(c))
+        extra = {"initial": True}
+        if redacted:
+            extra["secrets_redacted"] = sorted(rel for rel, _ in redacted)
+        repo.update_ref(branch, h, op="branch", expect=None, extra=extra)
+        cur = repo.current_branch()
+        if cur != branch and not repo.tip(cur):
+            # nothing has ever been saved here: give the branch we are
+            # standing on the same first save, so the two share a base
+            repo.update_ref(cur, h, op="branch", expect=None,
+                            extra={"initial": True, "seeded_from": branch})
+            seeded = cur
+    return h, len(work), redacted, seeded
 
 def cmd_branch(args):
     repo = need_repo()
@@ -1934,10 +2215,21 @@ def cmd_branch(args):
         die(f"'{args.name}' is not a valid branch name")
     if args.name in repo.branches():
         die(f"branch '{args.name}' already exists")
+    sync_locks(repo, quiet=True)
     head = repo.head_commit()
-    repo.update_ref(args.name, head, op="branch")
-    print(f"{dim('created branch')} {bold(args.name)} {dim('at')} {amber(short(head))}")
-    leaf(dim(f"switch to it: sb switch {args.name}"))
+    h, n_files, redacted, seeded = _create_branch(
+        repo, args.name, head, allow_secrets=getattr(args, "allow_secrets", False))
+    print(f"{dim('created branch')} {bold(args.name)} {dim('at')} "
+          f"{amber(short(h))}")
+    rows = [f'initial save {amber(short(h))}  ' + dim('"Initial branch '
+            f'creation" · {n_files} file(s) from this folder')]
+    if seeded:
+        rows.append(dim(f"'{seeded}' had no saves yet — it now starts from "
+                        "this same first save"))
+    rows.append(dim(f"switch to it: sb switch {args.name}  ·  it is "
+                    "mergeable immediately"))
+    tree_print(rows)
+    _report_redactions(redacted)
 
 def cmd_switch(args):
     repo = need_repo()
@@ -1947,16 +2239,26 @@ def cmd_switch(args):
     if args.target == repo.current_branch():
         print(f"already on {bold(args.target)}")
         return
-    ensure_clean(repo)
-    cur_tree, _ = head_tree_files(repo)
+    sync_locks(repo, quiet=True)
     target_commit = repo.tip(args.target)
     target_tree = (read_tree(repo, parse_commit(repo, target_commit)["tree"])
                    if target_commit else {})
-    checkout_tree(repo, target_tree, cur_tree)
+    keep = foreign_locks(repo)
+    work = snapshot_worktree(repo, write=False)
+    # If the folder is already exactly what the target branch holds, there is
+    # nothing to lose and nothing to write — this is what lets 'sb branch x'
+    # (which saves the folder onto x) be followed straight away by
+    # 'sb switch x' without an intervening save.
+    if ({k: v for k, v in work.items() if k not in keep}
+            != {k: v for k, v in target_tree.items() if k not in keep}):
+        ensure_clean(repo)
+    _checkout_preserving(repo, target_tree, work, keep)
     with repo.transaction():            # pointer + journal: one transaction
         repo.set_meta("branch", args.target)
         repo.journal("switch", {"to": args.target, "tip": target_commit or ""})
     print(f"{dim('switched to')} {bold(args.target)} {amber(short(target_commit))}")
+    if keep:
+        leaf(dim(f"{len(keep)} file(s) locked by others were left as they are"))
 
 def _parents(repo, h):
     return parse_commit(repo, h)["parents"]
@@ -2002,7 +2304,7 @@ def find_merge_base(repo, a, b):
 
 def cmd_merge(args):
     repo = need_repo()
-    process_lock_expiry(repo)
+    sync_locks(repo, quiet=True)
     theirs_tip = repo.resolve(args.branch)
     if theirs_tip is None:
         die(f"unknown branch '{args.branch}'")
@@ -2018,37 +2320,27 @@ def cmd_merge(args):
     name, email = author()
     ignore_locked = getattr(args, "ignore", False)
     skip = set()
-    if shared_mode(repo):
-        theirs_tree_pre = read_tree(repo, parse_commit(repo, theirs_tip)["tree"])
-        ours_tree_pre = read_tree(repo, parse_commit(repo, ours_tip)["tree"])
-        touched = {rel for rel in set(theirs_tree_pre) | set(ours_tree_pre)
-                   if theirs_tree_pre.get(rel) != ours_tree_pre.get(rel)}
-        blocked = [(p, l) for p, l in repo.locks().items()
-                   if p in touched and l["email"] != email]
-        if blocked and not ignore_locked:
-            print(red("merge blocked — it would change files locked by others:"))
-            tree_print([f"{red(p)}  " + dim(f"locked by {l['owner']} "
-                        + _ago(l["since"])) for p, l in blocked])
-            print(yellow("warning: ") + dim("these files hold others' "
-                  "in-progress edits."))
-            die("re-run with --ignore to merge everything else and leave these\n"
-                f"       files (and their locks) as they are:  "
-                f"sb merge {args.branch} --ignore \"<msg>\"")
-        if ignore_locked:
-            skip = {p for p, _ in blocked}
-    # the merge leaves `skip` files alone, so their on-disk (locked) edits
-    # don't count as blocking unsaved changes; the rest of the tree must be clean
-    if skip:
-        work = snapshot_worktree(repo, write=False)
-        tree, _ = head_tree_files(repo)
-        a, m, d = worktree_vs_tree(work, tree)
-        dirty = (set(a) | set(m) | set(d)) - skip
-        if dirty:
-            die("you have unsaved changes — run 'sb save' first, or "
-                "'sb undo -p <path>' to drop them\n       ("
-                + ", ".join(sorted(dirty)[:5]) + ")")
-    else:
-        ensure_clean(repo)
+    theirs_tree_pre = read_tree(repo, parse_commit(repo, theirs_tip)["tree"])
+    ours_tree_pre = read_tree(repo, parse_commit(repo, ours_tip)["tree"])
+    touched = {rel for rel in set(theirs_tree_pre) | set(ours_tree_pre)
+               if theirs_tree_pre.get(rel) != ours_tree_pre.get(rel)}
+    blocked = [(p, l) for p, l in repo.locks().items()
+               if p in touched and l["email"] != email]
+    if blocked and not ignore_locked:
+        print(red("merge blocked — it would change files locked by others:"))
+        tree_print([f"{red(p)}  " + dim(f"locked by {l['owner']} "
+                    + _ago(l["since"])) for p, l in blocked])
+        print(yellow("warning: ") + dim("these files hold others' "
+              "in-progress edits."))
+        die("re-run with --ignore to merge everything else and leave these\n"
+            f"       files (and their locks) as they are:  "
+            f"sb merge {args.branch} --ignore")
+    if ignore_locked:
+        skip = {p for p, _ in blocked}
+    # everyone else's locked files are exempt from the clean check (they are
+    # preserved on disk, never merged over); the rest of the tree must be clean
+    ensure_clean(repo, extra_exempt=skip)
+    preserve = skip | foreign_locks(repo)
     base = find_merge_base(repo, ours_tip, theirs_tip)
     ours_tree = read_tree(repo, parse_commit(repo, ours_tip)["tree"])
     theirs_tree = read_tree(repo, parse_commit(repo, theirs_tip)["tree"])
@@ -2060,7 +2352,7 @@ def cmd_merge(args):
         if not args.no_verify:
             if not run_stage(repo, "pre-merge", theirs_tree, commit=theirs_tip):
                 die("pre-merge tests failed — merge blocked (--no-verify to override)")
-        checkout_tree(repo, theirs_tree, ours_tree)
+        _checkout_preserving(repo, theirs_tree, ours_tree, preserve)
         repo.update_ref(repo.current_branch(), theirs_tip, op="merge",
                         expect=ours_tip)
         print(f"{bold('fast-forwarded')} {dim('to')} {amber(short(theirs_tip))}")
@@ -2111,16 +2403,17 @@ def cmd_merge(args):
                          commit=f"merge({short(ours_tip)},{short(theirs_tip)})"):
             die("pre-merge tests failed on the merged tree — merge blocked\n"
                 "       (fix on a branch and re-merge, or --no-verify to override)")
-    # write the merged tree, but DON'T touch skipped files on disk — their
+    # write the merged tree, but DON'T touch preserved files on disk — their
     # holders' in-progress edits must survive. We do this by telling checkout
     # those paths are already correct (current == target for them).
     checkout_current = dict(ours_tree)
     checkout_target = dict(merged)
-    for p in skip:
+    for p in preserve:
         checkout_target[p] = ours_tree.get(p)
         checkout_current[p] = ours_tree.get(p)   # marks as unchanged -> skipped
-    # extra guard: physically leave skip paths alone even if content matches
-    _checkout_preserving(repo, checkout_target, checkout_current, skip)
+    checkout_target = {k: v for k, v in checkout_target.items() if v is not None}
+    checkout_current = {k: v for k, v in checkout_current.items() if v is not None}
+    _checkout_preserving(repo, checkout_target, checkout_current, preserve)
     with repo.transaction():            # commit point: one transaction
         tree_hash = build_tree(repo, merged)
         # A merge that skipped locked files did NOT incorporate all of
@@ -2245,6 +2538,7 @@ def cmd_publish(args):
                     + dim(f"by {e['detail']['author']}") for e in recs])
         print(dim("record integrity: ") + chain)
         return
+    sync_locks(repo, quiet=True)
     head = repo.head_commit()
     if not head:
         die("nothing to publish — no saves yet")
@@ -2357,7 +2651,8 @@ def _verify(repo, quiet=False, anchor=None):
     unreachable = len(seen_commits) - reachable
 
     # 1c. remaining rows (orphaned blobs/trees left by an interrupted
-    #     operation): re-hash those too, so every stored object is checked.
+    #     operation, or the in-progress content a lock is protecting):
+    #     re-hash those too, so every stored object is checked.
     for h, kind in repo.db.execute("SELECT hash, kind FROM objects").fetchall():
         if h in seen_commits or h in seen_trees or h in seen_blobs:
             continue
@@ -2481,7 +2776,9 @@ def cmd_journal(args):
                                     ("skipped_secret_scan", "secrets-override"),
                                     ("global_force", "global-force"),
                                     ("secrets_redacted", "redacted"),
-                                    ("secrets_present", "secrets-present"))
+                                    ("secrets_present", "secrets-present"),
+                                    ("initial", "initial-save"),
+                                    ("seeded_from", "seeded"))
                      if d.get(f)]
             if audit:
                 what += "  " + yellow("· " + " · ".join(audit))
@@ -2499,6 +2796,13 @@ def cmd_journal(args):
             paths = d.get("paths", [])
             what = (", ".join(paths[:3]) + (" …" if len(paths) > 3 else "")
                     + (yellow("  · forced") if d.get("forced") else ""))
+        elif e["op"] == "lock-revert":
+            paths = d.get("paths", [])
+            kept = d.get("kept", {}) or {}
+            what = (", ".join(paths[:3]) + (" …" if len(paths) > 3 else "")
+                    + dim("  · put back to the holder's version")
+                    + (dim("  · kept " + ", ".join(short(h) for h in
+                       list(kept.values())[:3])) if kept else ""))
         elif e["op"] == "ignore":
             what = d.get("pattern", "")
         elif e["op"] == "identity":
@@ -2535,6 +2839,8 @@ def cmd_info(args):
         f"{counts.get('tree',0)} tree(s) · {counts.get('blob',0)} blob(s)",
         f"journal  {n_journal} entries · anchor "
         + amber(repo.chain_head()[:16]),
+        f"locks    {len(repo.locks())} active  "
+        + dim("(sb locks)"),
         f"you      {name} <{email}>  "
         + dim("(attribution only — no keys, no signatures)"),
     ])
@@ -2561,23 +2867,32 @@ def cmd_durability(args):
 
 def cmd_locks(args):
     repo = need_repo()
-    process_lock_expiry(repo)
+    sync_locks(repo, quiet=True)
     locks = repo.locks()
     if not locks:
         print(dim("no active locks")); return
     name, email = author()
     print(f"{len(locks)} active lock(s)")
-    tree_print([f"{cyan(p)}  " + dim(
-        f"{'you' if locks[p]['email']==email else locks[p]['owner']} · "
-        + _ago(locks[p]['since'])
-        + (f" · expires in {max(0,(locks[p]['since']+LOCK_TTL-int(time.time()))//60)}m"
-           ))
-        for p in sorted(locks)])
-    leaf(dim("release a lock: sb unlock <path>  ·  someone else's: --force"))
+    rows = []
+    for p in sorted(locks):
+        l = locks[p]
+        mine = l["email"] == email
+        left = max(0, (l["since"] + LOCK_TTL - int(time.time())) // 60)
+        note = (("you" if mine else l["owner"]) + " · " + _ago(l["since"])
+                + f" · expires in {left}m")
+        if l["held"] == LOCK_DELETED:
+            note += " · file removed"
+        elif l["held"]:
+            note += " · holding " + short(l["held"])
+        rows.append(f"{cyan(p)}  " + dim(note))
+    tree_print(rows)
+    leaf(dim("a locked file is its holder's until they save: other people's "
+             "edits to it are put back\n       release yours: sb unlock "
+             "<path>  ·  someone else's: --force"))
 
 def cmd_unlock(args):
     repo = need_repo()
-    process_lock_expiry(repo)
+    sync_locks(repo, quiet=True)
     name, email = author()
     force = getattr(args, "force", False)
     locks = repo.locks()
@@ -2605,11 +2920,41 @@ def cmd_unlock(args):
     if freed:
         print(f"unlocked {len(freed)} file(s)" + (dim(" (forced)") if force else ""))
         tree_print([cyan(p) for p in sorted(freed)])
+        leaf(dim("their content stays on disk — whoever edits next takes "
+                 "the lock"))
     if missing:
         leaf(dim(f"{len(missing)} not locked: " + ", ".join(sorted(missing)[:4])))
     if denied:
         die(f"{len(denied)} held by others — add --force to release: "
             + ", ".join(sorted(denied)[:4]))
+
+def cmd_salvage(args):
+    """Write any stored content back out to a file. Its main use is the
+    other side of a lock revert: when your edit to someone else's locked
+    file is put back, the bytes you wrote are stored and their hash printed
+    (and journaled), so nothing you typed is ever actually destroyed."""
+    repo = need_repo()
+    h = (args.hash or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{4,64}", h):
+        die("a content hash is 4-64 hex characters (sb prints 10)\n"
+            "       find one in 'sb journal' next to a lock-revert entry")
+    rows = repo.db.execute(
+        "SELECT hash FROM objects WHERE kind='blob' AND hash LIKE ? LIMIT 3",
+        (h + "%",)).fetchall()
+    if not rows:
+        die(f"no stored content starts with '{h}'")
+    if len(rows) > 1:
+        die(f"'{h}' matches {len(rows)} stored objects — give more characters")
+    full = rows[0][0]
+    data = repo.get(full)[1]                    # re-hashed on read
+    dest = Path(args.dest) if args.dest else Path(f"salvaged-{short(full)}")
+    if dest.exists():
+        die(f"{dest} already exists — choose another name")
+    if dest.parent and not dest.parent.exists():
+        dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(data)
+    print(f"{bold('salvaged')} {amber(short(full))} {dim('→')} "
+          f"{cyan(str(dest))} " + dim(f"({len(data):,} bytes)"))
 
 def cmd_who(args):
     if args.name:
@@ -2643,7 +2988,8 @@ def cmd_selftest(args):
     tool must survive: crash injection at the ref/journal boundary, symlink
     escape and file/directory path safety, save consistency under mid-gate
     mutation, merge byte-fidelity, compare-and-swap under concurrent saves,
-    full-store verification, archive salt uniqueness, and shared-mode locks.
+    full-store verification, archive salt uniqueness, branch bootstrapping,
+    and the shared content-lock model.
     Exits 0 if everything passes, non-zero otherwise."""
     import shutil as _sh, threading as _th, io as _io, tarfile as _tar
     import sqlite3 as _sql, zlib as _zl
@@ -2761,6 +3107,54 @@ def cmd_selftest(args):
             check("consistency: mid-gate mutation blocks save",
                   "changed while" in (r.stdout + r.stderr)
                   and "first" in run("log", "-n", "1").stdout)
+        finally:
+            os.chdir(old); _sh.rmtree(d, ignore_errors=True)
+
+    @case
+    def branch_starts_saved():
+        d, old = fresh(); os.chdir(d)
+        try:
+            run("init")
+            Path("a.txt").write_text("hello\n")      # never saved by hand
+            r = run("branch", "feat")
+            seeded = "Initial branch creation" in run("log").stdout
+            run("switch", "feat", expect=0)          # no save needed first
+            clean = "clean" in run("status").stdout
+            Path("b.txt").write_text("new\n")
+            run("save", "work on feat")
+            run("switch", "main", expect=0)
+            m = run("merge", "feat")
+            check("branch: a new branch saves the folder immediately",
+                  r.returncode == 0 and seeded and clean)
+            check("branch: mergeable at once, with no manual first save",
+                  m.returncode == 0 and Path("b.txt").exists()
+                  and Path("a.txt").read_text() == "hello\n")
+        finally:
+            os.chdir(old); _sh.rmtree(d, ignore_errors=True)
+
+    @case
+    def branch_captures_unsaved_work():
+        d, old = fresh(); os.chdir(d)
+        try:
+            run("init"); Path("a").write_text("1"); run("save", "a")
+            Path("b").write_text("2")                # unsaved when branching
+            run("branch", "feat", expect=0)
+            run("switch", "feat", expect=0)
+            check("branch: unsaved work goes into the initial save",
+                  "clean" in run("status").stdout and Path("b").exists())
+        finally:
+            os.chdir(old); _sh.rmtree(d, ignore_errors=True)
+
+    @case
+    def merge_keeps_our_only_file():
+        d, old = fresh(); os.chdir(d)
+        try:
+            run("init"); Path("seed").write_text("s"); run("save", "s")
+            run("branch", "feat")
+            Path("mine.txt").write_text("mine\n"); run("save", "only on main")
+            r = run("merge", "feat")
+            check("merge: a file only our side has is kept, not deleted",
+                  r.returncode == 0 and Path("mine.txt").exists())
         finally:
             os.chdir(old); _sh.rmtree(d, ignore_errors=True)
 
@@ -2914,6 +3308,62 @@ def cmd_selftest(args):
             check("secrets: --allow-secrets saves verbatim",
                   fake in (xd / "chk3/cfg2.py").read_text())
         finally:
+            os.chdir(old); _sh.rmtree(d, ignore_errors=True)
+            _sh.rmtree(xd, ignore_errors=True)
+
+    @case
+    def lock_content_wins():
+        """The 1.4 rule: a locked file IS its holder's version. Anyone may
+        type into it; on the next command their bytes are put back and kept
+        in the store, and only the holder can commit it."""
+        d, old = fresh(); os.chdir(d)
+        xd = Path(tempfile.mkdtemp(prefix="sbexp-"))
+        env0 = dict(os.environ)
+        def as_user(n, e, *a, **k):
+            os.environ["SB_NAME"] = n; os.environ["SB_EMAIL"] = e
+            return run(*a, **k)
+        try:
+            as_user("Lead", "l@co", "init")
+            Path("f.txt").write_text("v1\n")
+            as_user("Lead", "l@co", "save", "seed")
+            Path("f.txt").write_text("alice\n")
+            as_user("Alice", "a@co", "status")          # alice takes the lock
+            Path("f.txt").write_text("bob\n")           # bob types over it
+            r = as_user("Bob", "b@co", "status")
+            check("locks: a foreign edit is put back to the holder's version",
+                  Path("f.txt").read_text() == "alice\n")
+            m = re.search(r"kept as ([0-9a-f]{6,})", r.stdout)
+            check("locks: the overwritten bytes are stored, not destroyed",
+                  m is not None)
+            if m:
+                as_user("Bob", "b@co", "salvage", m.group(1),
+                        str(xd / "bobs.txt"), expect=0)
+                check("locks: sb salvage brings the rejected version back",
+                      (xd / "bobs.txt").read_text() == "bob\n")
+            as_user("Bob", "b@co", "save", "try to take it")
+            as_user("Lead", "l@co", "export", "main", str(xd / "chk1"))
+            check("locks: nobody but the holder can save a locked file",
+                  (xd / "chk1/f.txt").read_text() == "v1\n")
+            Path("f.txt").write_text("alice2\n")        # holder edits again
+            as_user("Alice", "a@co", "status")
+            Path("f.txt").write_text("bob2\n")
+            as_user("Bob", "b@co", "status")
+            check("locks: the protected version follows the holder's edits",
+                  Path("f.txt").read_text() == "alice2\n")
+            as_user("Alice", "a@co", "save", "alice's work")
+            as_user("Lead", "l@co", "export", "main", str(xd / "chk2"))
+            check("locks: the holder's save lands and frees the file",
+                  (xd / "chk2/f.txt").read_text() == "alice2\n"
+                  and not Repo(Path(".").resolve()).locks())
+            # putting a file back the way it was saved retires its lock
+            Path("f.txt").write_text("carol\n")
+            as_user("Carol", "c@co", "status")
+            Path("f.txt").write_text("alice2\n")
+            as_user("Carol", "c@co", "status")
+            check("locks: a lock retires when nothing is left to protect",
+                  not Repo(Path(".").resolve()).locks())
+        finally:
+            os.environ.clear(); os.environ.update(env0)
             os.chdir(old); _sh.rmtree(d, ignore_errors=True)
             _sh.rmtree(xd, ignore_errors=True)
 
@@ -3699,6 +4149,7 @@ USAGES = {
     "sb durability": "sb durability [full|normal]",
     "sb locks":   "sb locks",
     "sb unlock":  "sb unlock [<path>...] [--force]",
+    "sb salvage": "sb salvage <hash> [<path>]",
     "sb status":  "sb status [--deep]",
     "sb ignore":  "sb ignore <pattern>",
     "sb pack":    "sb pack [<output>] -k <passkey> [-f]",
@@ -3758,10 +4209,10 @@ HELP = f"""
 {_row('init', 'start tracking this folder')}
 {_row('status', 'what changed since the last save')}
 {_opt('--deep', 'hash every file instead of trusting the stat cache')}
-{_row('save "<message>"', 'snapshot everything')}
+{_row('save "<message>"', 'snapshot your changes')}
 {_opt('--allow-secrets', 'save detected secrets verbatim (no redaction)')}
 {_opt('--no-verify', 'skip the pre-save tests')}
-{_opt('--global-force', 'save everyone\'s edits, not just yours')}
+{_opt('--global-force', "save everyone's edits, not just yours")}
 {_row('log', 'history of saves, newest first')}
 {_opt('-n, --limit <count>', 'show only the newest <count> saves')}
 {_row('diff [<path>]', 'line-by-line changes, all files or one path')}
@@ -3770,7 +4221,8 @@ HELP = f"""
 {_row('restore <version>', 'return to any past anchor, save, or release', last=True)}
 
 {amber('branches')}
-{_row('branch [<name>]', 'list branches, or create one named <name>')}
+{_row('branch [<name>]', 'list branches, or create one — a new branch')}
+{_opt('', 'saves this folder at once, so it is mergeable straight away')}
 {_opt('-r, --remove', 'remove branch <name> instead of creating it')}
 {_row('switch <branch>', 'move between branches')}
 {_row('merge <branch>', 'bring <branch> into the current one', last=True)}
@@ -3799,14 +4251,20 @@ HELP = f"""
 {_row('export <version> [<destination>]', 'files of a release, branch, or save', last=True)}
 {_opt('-k, --key <passkey>', 'write an encrypted .sbox instead of a folder', cont=False)}
 
+{amber('shared editing')}
+{_row('locks', 'who holds which file, and for how long')}
+{_opt('', 'editing a file locks it: your version wins until you save,')}
+{_opt('', "and anyone else's edit to it is put back on the next command")}
+{_row('unlock [<path>...]', "release your locks (--force: others')")}
+{_row('salvage <hash> [<path>]', 'write stored content back out to a file', last=True)}
+{_opt('', 'how you get back an edit a lock put back', cont=False)}
+
 {amber('repository')}
 {_row('journal', 'log of every operation')}
 {_opt('-n, --limit <count>', 'show only the newest <count> entries')}
 {_row('info', 'stats and chain head')}
 {_row('who [<name>] [<email>]', 'set or show how saves are attributed')}
 {_row('durability [full|normal]', 'crash/power-loss durability')}
-{_row('locks', 'show per-file locks and their holders')}
-{_row('unlock [<path>...]', 'release your locks (--force: others\')')}
 {_row('ignore <pattern>', 'add a .sbignore pattern', last=True)}
 """
 
@@ -3839,6 +4297,7 @@ def main(argv=None):
         rp = sub.add_parser("restore"); rp.add_argument("target")
         bp = sub.add_parser("branch"); bp.add_argument("name", nargs="?")
         bp.add_argument("-r", "--remove", action="store_true")
+        bp.add_argument("--allow-secrets", action="store_true")
         wp = sub.add_parser("switch"); wp.add_argument("target")
         mp = sub.add_parser("merge"); mp.add_argument("branch")
         mp.add_argument("--no-verify", action="store_true")
@@ -3846,6 +4305,8 @@ def main(argv=None):
         lkp = sub.add_parser("locks"); lkp.add_argument("args", nargs="*")
         ulp = sub.add_parser("unlock"); ulp.add_argument("paths", nargs="*")
         ulp.add_argument("--force", action="store_true")
+        svp = sub.add_parser("salvage"); svp.add_argument("hash")
+        svp.add_argument("dest", nargs="?")
         tp = sub.add_parser("test"); tp.add_argument("args", nargs="*")
         dpl = sub.add_parser("publish"); dpl.add_argument("label", nargs="?")
         dpl.add_argument("-l", "--list", action="store_true")
