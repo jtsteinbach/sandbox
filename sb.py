@@ -2,7 +2,7 @@
 """
 sandbox (sb) — version control in a single file.
 
-version   1.4
+version   1.3
 author    jts.gg/sandbox
 """
 
@@ -11,7 +11,7 @@ import argparse, contextlib
 import sqlite3, subprocess, tempfile, getpass, shutil
 from pathlib import Path
 
-VERSION = "1.4"
+VERSION = "1.3"
 AUTHOR = "jts.gg/sandbox"
 FORMAT_VERSION = 1
 SB_DIR = ".sb"
