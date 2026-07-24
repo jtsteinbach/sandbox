@@ -1,13 +1,19 @@
 # sandbox (sb)
 
-**Version 1.2** · [jts.gg/sandbox](https://jts.gg/sandbox)
+**Version 1.3** · [jts.gg/sandbox](https://jts.gg/sandbox)
 **License** · [jts.gg/license](https://jts.gg/license)
 
 Safe version control in one file. One command vocabulary you can learn in five minutes. No dependencies beyond Python 3.9+, no cryptography libraries, and no command that destroys saved history.
 
 sandbox is not a git clone and does not use git's repository format. It keeps the two ideas git got right (content addressing and a Merkle DAG of snapshots) and drops the staging area, detached HEADs, destructive commands, and the loose-file repository layout.
 
-New in 1.2: shared mode (one repository, a whole team, per-file locks), rename detection, a journal that records every operation including gate bypasses, archives verified end to end before install, and hardened write paths throughout.
+New in 1.3:
+
+- **Shared editing is always on.** There is no `sb shared on/off` any more and no single-user mode. A repository used by one person simply never sees another person's lock.
+- **Locks protect content, not permission.** While you hold a lock, your bytes *are* the file: anyone can edit it, but their version is put back to yours on the next sb command, and their bytes are kept and recoverable with the new `sb salvage`.
+- **Branches are born saved.** `sb branch <name>` takes an immediate first save (`"Initial branch creation"`), so a new branch can be switched to, tested, and merged straight away.
+- **Secrets are redacted, not blocked.** A recognized credential is replaced with `<REDACTED>` in the committed blob; the file on disk is never touched, and the redaction is journaled.
+- **Pass-keys can come from a prompt or `SB_PASSKEY`** instead of the command line.
 
 ---
 
@@ -18,9 +24,9 @@ New in 1.2: shared mode (one repository, a whole team, per-file locks), rename d
 3. [Quickstart](#3-quickstart)
 4. [Core concepts](#4-core-concepts)
 5. [Command reference](#5-command-reference)
-6. [Shared mode](#6-shared-mode)
+6. [Shared editing and locks](#6-shared-editing-and-locks)
 7. [Test gates](#7-test-gates)
-8. [The secret scanner](#8-the-secret-scanner)
+8. [Secrets and redaction](#8-secrets-and-redaction)
 9. [Security model](#9-security-model)
 10. [Anchors](#10-anchors)
 11. [Portable archives (.sbox)](#11-portable-archives-sbox)
@@ -68,7 +74,9 @@ chmod +x ~/.local/bin/sb
 
 If `~/.local/bin` is not on your PATH, add `export PATH="$HOME/.local/bin:$PATH"` to your shell profile.
 
-To upgrade, re-run the install command. sandbox refuses to open repositories created by a newer format than it understands, so upgrades are safe and downgrades fail with a clear message instead of corrupting anything. `sb selftest` runs the built-in test suite (20 checks: crash injection, symlink escapes, races, corruption, archive crypto, shared-mode locking) whenever you want proof the installed copy behaves.
+To upgrade, re-run the install command. sandbox refuses to open repositories created by a newer format than it understands, so upgrades are safe and downgrades fail with a clear message instead of corrupting anything. Repositories from earlier versions are migrated in place the first time 1.3 opens them: the lock table gains the columns the content-lock model needs, and any lock recorded before the upgrade adopts whatever is on disk as the content it protects.
+
+`sb selftest` runs the built-in adversarial suite (37 checks across 19 cases: crash injection, symlink escapes, file/directory transitions, races, corruption, archive crypto, secret redaction, branch bootstrapping, and the content-lock protocol) whenever you want proof the installed copy behaves.
 
 ---
 
@@ -78,9 +86,9 @@ Version control solves a real problem: change things without fear, and know exac
 
 sandbox is built on three decisions.
 
-First, safety is structural. No sandbox command discards saved history. `undo` creates new history that reverts the old. `switch` refuses to run over unsaved work. The store is one SQLite database, so every operation is a single atomic transaction; a crash mid-save leaves you exactly where you were.
+First, safety is structural. No sandbox command discards saved history. `undo` creates new history that reverts the old. `switch` refuses to run over unsaved work. A lock revert stores the bytes it displaces. The store is one SQLite database, so every operation is a single atomic transaction; a crash mid-save leaves you exactly where you were.
 
-Second, simple doesn't mean toy. There is no staging area (a save snapshots everything that isn't ignored), no detached HEAD, and no rebase. There are real branches, three-way merges with automatic conflict-free merging, rename detection, versioned test gates, release records, per-file team locking, and a full-store integrity verifier.
+Second, simple doesn't mean toy. There is no staging area (a save snapshots everything that isn't ignored), no detached HEAD, and no rebase. There are real branches, three-way merges with automatic conflict-free merging, rename detection, versioned test gates, release records, per-file content locks for teams, and a full-store integrity verifier.
 
 Third, security claims are kept narrow and true. sandbox promises integrity, tamper evidence, and leak prevention. Section 9 states how each works, what it defends against, and what it doesn't. There are no keys and no signatures; everything rests on SHA-256 from the standard library, used for content addressing and hash chaining.
 
@@ -96,12 +104,12 @@ sb init                          # creates .sb/sandbox.db, branch "main"
 sb who "Ada" "ada@example.com"   # how your saves are attributed (once, globally)
 
 # work, then snapshot
-sb status                        # what changed? (renames detected)
+sb status                        # what changed? (renames detected, locks shown)
 sb diff                          # line-by-line changes
-sb save "add login form"         # snapshot everything
+sb save "add login form"         # snapshot your changes
 
 # experiment on a branch
-sb branch idea
+sb branch idea                   # creates it AND saves this folder onto it
 sb switch idea                   # refuses if you'd lose unsaved work
 sb save "try the risky refactor"
 sb switch main
@@ -127,7 +135,7 @@ sb pack -k "a-strong-pass-key"                        # seal repo + history into
 sb unpack my-project.sbox -k "a-strong-pass-key"      # restore elsewhere (verified before install)
 ```
 
-Shared mode (`sb shared on`), test gates, and anchors are covered below.
+Locks (Section 6) need no setup: they are always on, and editing a file is what takes one.
 
 ---
 
@@ -135,13 +143,23 @@ Shared mode (`sb shared on`), test gates, and anchors are covered below.
 
 ### Saves
 
-A save is a complete snapshot of every tracked file, with a message, an author, and a timestamp. There is no staging area and no partial commit: what you see in your working folder, minus ignored files, is what gets saved. This makes "the tests passed on this save" mean something, because the save is exactly the tree that was tested. (Shared mode refines this: your save commits your files and leaves teammates' in-progress edits alone. Section 6.)
+A save is a complete snapshot of every tracked file, with a message, an author, and a timestamp. There is no staging area and no partial commit: what you see in your working folder, minus ignored files, is what gets saved. This makes "the tests passed on this save" mean something, because the save is exactly the tree that was tested.
+
+One refinement, which is what makes a shared folder workable: a save commits *your* files and leaves everyone else's in-progress edits exactly as they are, on disk and in the commit (Section 6). `sb save --global-force` sweeps in everyone's edits and says so in the journal.
 
 Every save records the hash of its parent, so saves form a chain, and with merges a DAG. Changing any byte of any past save would change its hash and break every link after it.
 
 ### Branches
 
-A branch is a named pointer to a save. Creating one is instant (`sb branch idea`). You are always on exactly one branch; there is no detached-HEAD state. Switching rewrites the working folder to match the branch's latest save, and refuses to run if you have unsaved changes.
+A branch is a named pointer to a save, and it is never just a name: creating one (`sb branch idea`) immediately saves the working folder onto it with the message `Initial branch creation`. A new branch therefore has content from the moment it exists and can be switched to, tested, exported, and merged straight away.
+
+If the branch you are standing on has never been saved, it is seeded with that same first commit, so both branches share one common base and an immediate merge is meaningful rather than an error.
+
+You are always on exactly one branch; there is no detached-HEAD state. Switching rewrites the working folder to match the branch's latest save, and refuses to run if you have unsaved changes — except when the folder already equals the target branch's tree, which is what lets `sb branch x` be followed straight away by `sb switch x`.
+
+### Locks
+
+Editing a file locks it to you. A lock records the exact content you are protecting: while you hold it, your version is the file, other people's edits to it are put back, and only you can commit it. Locks are always on, need no configuration, and cost nothing in a repository with one user. Section 6.
 
 ### The object store
 
@@ -157,7 +175,7 @@ Every object is re-hashed on every read, not just during `verify`. A damaged blo
 
 ### The journal
 
-The journal is an append-only log inside the store recording every operation: saves, merges, undos, restores, branch creation and removal, switches, releases, lock releases, ignore rules, shared/durability changes, identity registrations, and pack/export/unpack events. Each entry embeds the SHA-256 link of the previous entry, forming a hash chain rooted in a random repository ID chosen at `init`.
+The journal is an append-only log inside the store recording every operation: saves, merges, undos, restores, branch creation and removal, switches, releases, lock releases, lock reverts, expiry auto-saves, ignore rules, durability changes, identity registrations, and pack/export/unpack events. Each entry embeds the SHA-256 link of the previous entry, forming a hash chain rooted in a random repository ID chosen at `init`.
 
 The consequences:
 
@@ -165,7 +183,7 @@ The consequences:
 - Moving, deleting, or injecting a branch tip behind sandbox's back (direct SQL included) is caught by `sb verify`, which cross-checks refs against the journal.
 - Replacing an object is caught by the content re-hash.
 
-Gate bypasses are part of the record: a save made with `--no-verify` or `--allow-secrets` carries that fact in its journal entry, and `sb journal` shows it inline (`· no-verify · secrets-override`). Skipping a gate is allowed; hiding it is not.
+Anything unusual about a save is part of the record, and `sb journal` shows it inline: `· no-verify`, `· secrets-override`, `· global-force`, `· redacted`, `· secrets-present`, `· initial-save`, `· seeded`. Skipping a gate is allowed; hiding it is not.
 
 ### Renames
 
@@ -184,11 +202,13 @@ The grammar is consistent across commands:
 - Positional arguments say what: a message, a path, a branch, a version.
 - Options say how, and each routine option has a short and long form: `-k`/`--key`, `-f`/`--files-only`, `-i`/`--ignore`, `-n`/`--limit`, `-r`/`--remove`, `-a`/`--anchor`, `-l`/`--list`, `-p`/`--path`. Options may appear anywhere on the line.
 - The safety overrides (`--allow-secrets`, `--no-verify`, `--global-force`, `--force`) deliberately have no short form. Bypassing a gate or taking someone's lock is typed out in full. `-i` is not in this class: skipping locked files in a merge, or unpacking into a non-empty folder, is routine once you've asked for it explicitly.
-- Pass-keys are always `-k <passkey>` across `pack`, `unpack`, and `export`.
+- Pass-keys are always `-k <passkey>` across `pack`, `unpack`, and `export`, or `SB_PASSKEY`, or an interactive prompt.
 - Subactions are words: `sb test list`, `sb test new`, `sb publish list` (`-l` also works).
 - Mistakes get a one-line explanation, the correct usage line for that command, and a pointer to `sb help`, not a parser dump.
 
 `<angle brackets>` are required, `[square brackets]` optional. Commands work from anywhere inside the repository. Colors appear only when output is a terminal.
+
+Every command that touches repository state first synchronizes locks (enforce, expire, acquire) — that is how a daemon-less tool keeps the shared folder consistent.
 
 ### `sb init`
 
@@ -196,19 +216,20 @@ Creates the repository: `.sb/sandbox.db`, branch `main`, and a journal seeded wi
 
 ### `sb status [--deep]`
 
-Current branch, latest save, and every change relative to it: `renamed old → new`, `new`, `modified`, `deleted`. In shared mode, also shows who holds which locks. `--deep` bypasses the stat cache and re-hashes every file.
+Current branch, latest save, active locks (who holds what, and `their version wins` for other people's), and every change relative to the last save: `renamed old → new`, `new`, `modified`, `deleted`. Files that belong to someone else's lock are marked `(theirs)` and are not counted in the changes your next save would commit. `--deep` bypasses the stat cache and re-hashes every file.
 
 ### `sb save "<message>" [--allow-secrets] [--no-verify] [--global-force]`
 
-Snapshots every tracked file as a new save. The message is required. In order:
+Snapshots your changed files as a new save. The message is required. In order:
 
-1. Diff against the last save; if nothing changed, no save is created.
-2. Secret scan over every added or modified file (Section 8). Findings block; `--allow-secrets` overrides.
-3. Pre-save test gates in a clean checkout of the candidate tree (Section 7). Failures block; `--no-verify` overrides.
-4. Re-check that the worktree didn't change while being scanned and tested; refuse rather than commit an untested state.
-5. Store blobs, build the tree, write the commit, move the branch tip, and journal it, in one transaction. Bypass flags are journaled with it.
+1. Synchronize locks: put other people's locked files back to their versions, expire abandoned locks, and take locks on the files you have edited.
+2. Work out your file set: the files you changed, excluding every file another person holds a lock on.
+3. Redaction pass: recognized credentials in your added or modified files are replaced with `<REDACTED>` in the blob about to be committed (Section 8). The file on disk is never rewritten. `--allow-secrets` commits them verbatim instead. A file that contains a credential but is not clean UTF-8 cannot be rewritten faithfully, so it blocks the save rather than being mangled.
+4. Pre-save test gates in a clean checkout of the candidate tree (Section 7). Failures block; `--no-verify` overrides.
+5. Re-check that the worktree didn't change while being scanned and tested; refuse rather than commit an untested state.
+6. Store blobs, build the tree, write the commit, move the branch tip, release your locks, and journal it, in one transaction. Bypasses and redactions are journaled with it.
 
-In shared mode, `save` commits only your files (Section 6); `--global-force` sweeps in everyone's edits and is journaled as such.
+`--global-force` snapshots the entire worktree, everyone's edits included, and releases every lock. It is journaled as `global-force`.
 
 ### `sb log [-n <count>]`
 
@@ -220,23 +241,25 @@ Unified diff between the working folder and the last save. Renames show as one `
 
 ### `sb undo [-p <path>]`
 
-Reverts the latest save by creating a new save whose content equals the previous one. The undone save stays in the log and journal; running `sb undo` again redoes. Requires a clean working tree.
+Reverts the latest save by creating a new save whose content equals the previous one. The undone save stays in the log and journal; running `sb undo` again redoes. Requires a clean working tree — other people's locked files are exempt from that check and are never written over.
 
 With `-p <path>`, brings just that file or folder back from the last save, overwriting the working copy. No new save is created. These writes go through the same symlink-safe atomic machinery as checkout, so a symlink planted at the path or in a parent cannot redirect the write outside the repository.
 
 ### `sb restore <anchor | save | release-label | branch>`
 
-Returns the current branch to any past state, as a new save. Nothing is rewound or deleted; `sb undo` afterward takes you straight back. Requires a clean working tree.
+Returns the current branch to any past state, as a new save. Nothing is rewound or deleted; `sb undo` afterward takes you straight back. Requires a clean working tree (again, other people's locked files excepted).
 
 Targets: an anchor (8–64 hex characters of a journal chain link, resolving to the branch tip as the journal recorded it at that moment), a save-hash prefix from `sb log` (4+ characters), a release label (`sb restore rel-3`), or a branch name. Ambiguous targets are rejected with a list of what matched.
 
-### `sb branch [<name>] [-r]`
+### `sb branch [<name>] [-r] [--allow-secrets]`
 
-No argument: list branches. With a name: create one at the current save. With `-r`: delete the named branch's pointer (never the current branch, never the last one). Its saves stay in the store and journal, and `verify` keeps checking them.
+No argument: list branches. With a name: create it **and immediately save the working folder onto it** as `Initial branch creation`. With `-r`: delete the named branch's pointer (never the current branch, never the last one). Its saves stay in the store and journal, and `verify` keeps checking them.
+
+The initial save behaves like any other save: credentials are redacted (`--allow-secrets` commits them verbatim), and files another person holds a lock on are taken from the last save rather than from disk, because their in-progress work is theirs to commit. If the current branch has no saves yet, it is seeded with the same commit.
 
 ### `sb switch <branch>`
 
-Rewrites the working folder to the branch's latest save and updates the branch pointer. Refuses with unsaved changes. Writes are atomic and symlink-safe; directories emptied by the switch are pruned.
+Rewrites the working folder to the branch's latest save and updates the branch pointer. Refuses with unsaved changes, unless the folder already matches the target exactly. Files locked by other people are left alone and reported. Writes are atomic and symlink-safe; directories emptied by the switch are pruned.
 
 ### `sb merge <branch> [--no-verify] [-i]`
 
@@ -244,6 +267,7 @@ Three-way merge into the current branch, using the best common ancestor as the b
 
 - If the current branch is an ancestor of the target, the tip fast-forwards (still gated by pre-merge tests).
 - Files changed on one side take that side.
+- A file that exists on only one side, and never existed in the base, is kept. Deletion happens only when the base had the file and one side removed it.
 - Files changed on both sides get a line-level three-way merge; non-overlapping edits combine, overlapping edits conflict.
 - On conflict, the merge stops before touching anything. Your working folder is unchanged, and each conflicting file is listed with the reason. Reconcile on one branch, save, merge again. There is no in-progress merge state.
 
@@ -251,7 +275,7 @@ The merge is conservative on purpose: adjacent-line edits, same-point insertions
 
 Pre-merge gates run against the merged tree itself before it is committed.
 
-With `-i` (`--ignore`), in shared mode: skip files locked by others. A merge that skipped files is recorded as partial (a single-parent save, not a merge commit), so re-running the merge after the locks release brings in the skipped files. sandbox does not record ancestry it didn't actually merge.
+A merge that would change a file someone else has locked is refused. With `-i` (`--ignore`), those files are skipped: the merge proceeds for everything else, each skipped file keeps your current version and its lock, and the result is recorded as a partial merge (a single-parent save, not a merge commit), so re-running the merge after the locks release brings in what was skipped. sandbox does not record ancestry it didn't actually merge.
 
 ### `sb test [<stage>]` / `sb test new <stage> <name>` / `sb test list` / `sb test guide`
 
@@ -286,7 +310,7 @@ history is intact ✓ — store, journal and refs all agree
 
 ### `sb journal [-n <count>]`
 
-The operation log, with detail for every operation type: ref moves with old → new hashes and any bypass flags, releases, switches, branch removals, lock releases (with `· forced` when forced), ignore rules, shared/durability changes, identity registrations, and pack/export/unpack events. Ends by re-verifying the chain.
+The operation log, with detail for every operation type: ref moves with old → new hashes and any bypass, redaction, or initial-save markers; releases; switches; branch removals; lock releases (with `· forced` when forced); lock reverts (with the paths put back and the hashes of the bytes kept); ignore rules; durability changes; identity registrations; and pack/export/unpack events. Ends by re-verifying the chain.
 
 ### `sb info`
 
@@ -296,21 +320,21 @@ One-screen overview: store location and size, current branch, object counts, jou
 
 Shows or sets how saves are attributed, stored in `~/.config/sandbox/profile.json` (`SB_HOME` overrides the location; `SB_NAME`/`SB_EMAIL` override per command). Attribution, not authentication (Section 9).
 
-### `sb shared [on|off]`
-
-Shows or sets shared mode (Section 6). Journaled.
-
 ### `sb durability [full|normal]`
 
 Shows or sets crash durability. `full` (default): the newest committed transaction survives power loss. `normal`: faster, still crash-safe, but may lose the most recent commit on power loss. Journaled.
 
 ### `sb locks`
 
-All shared-mode locks: who holds what, since when, and when each expires.
+Every active lock: the path, who holds it, how long they have held it, when it expires, and a short hash of the content being protected (`· file removed` when the holder deleted it).
 
 ### `sb unlock [<path>...] [--force]`
 
-Releases your locks (all, or the named paths). `--force` releases locks held by others; the journal records the paths, the prior owners, and that it was forced.
+Releases your locks (all, or the named paths). `--force` releases locks held by others; the journal records the paths, the prior owners, and that it was forced. Releasing a lock does not change any file — it only stops sandbox putting that file back.
+
+### `sb salvage <hash> [<path>]`
+
+Writes any stored content back out to a file. This is the other side of a lock revert: when your edit to someone else's locked file is put back, the bytes you wrote are stored, their hash is printed and journaled, and this command brings them back. The hash is 4–64 hex characters (sb prints 10) and must be unambiguous; the destination defaults to `salvaged-<hash>` and is never overwritten if it exists.
 
 ### `sb ignore <pattern>`
 
@@ -339,35 +363,36 @@ The destination must be fresh or empty. `-i` (`--ignore`) merges into a non-empt
 
 ### `sb version` / `sb selftest`
 
-`sb version` (also `-V`) prints `sb 1.2 · jts.gg/sandbox`. `sb selftest` runs the 20-check built-in suite: atomic rollback, symlink and path escapes, mid-gate mutation, CRLF merge safety, concurrent-save races, corruption detection, archive crypto, the stat cache, and the shared-mode locking protocol.
+`sb version` (also `-V`) prints `sb 1.3 · jts.gg/sandbox`. `sb selftest` runs the built-in adversarial suite — 37 checks across 19 cases: atomic rollback, symlink and path escapes, file/directory transitions, mid-gate mutation, CRLF merge safety, add/add merges, merge base correctness, branch bootstrapping, concurrent-save races, compare-and-swap, corruption detection, archive crypto, the stat cache, secret redaction, and the content-lock protocol end to end.
 
 ---
 
-## 6. Shared mode
+## 6. Shared editing and locks
 
-Shared mode lets a small team work in one repository — one folder, one database — with per-file locks instead of clone/push/pull. Turn it on once per repository:
-
-```bash
-sb shared on
-```
+A whole team can work in one repository — one folder, one database — without clone/push/pull. This is not a mode and cannot be turned off. A repository with one user simply never sees a foreign lock, and everything below collapses to ordinary solo behavior.
 
 ### The rules
 
-- Editing a file locks it to you. There is no daemon; locks are picked up the next time any sandbox command scans the tree, and attributed to the actual editor (below).
-- A lock lasts until you `sb save`, or one hour (`SB_LOCK_TTL`). On expiry, your edits are auto-saved as a commit in your name and the lock frees, so an abandoned lock can't block the team and no work is lost.
-- While you hold a lock, only you can save that file. `sb save` commits your locked/changed files and leaves everyone else's in-progress edits alone, on disk and in the commit. `sb save --global-force` sweeps in everyone's edits, and the journal says so.
-- A merge that would change a file someone else has locked is refused. `sb merge <branch> -i` skips those files; the merge proceeds for everything else, each skipped file keeps your current version, and the result is recorded as a partial merge (single parent), so re-running the merge after the locks release picks up what was skipped.
-- `sb locks` shows who holds what. `sb unlock` releases yours. `sb unlock --force` releases someone else's, journaled with the prior owner's name.
+- **Editing a file locks it to you.** There is no daemon; locks are claimed the next time any sandbox command scans the tree, and attributed to the actual editor (below).
+- **While you hold a lock, your bytes are the file.** Anyone may open and edit it, and nothing stops them typing. But on the next sandbox command their version is put back on disk to yours. Their rejected bytes are stored and named in the journal, so `sb salvage <hash> [<path>]` writes them out again: the revert refuses to let a second writer's copy become the version of record, and destroys nothing.
+- **Only you can save it.** Everyone else's `sb save` skips your locked files entirely, whatever is on disk. `sb save --global-force` is the deliberate exception, and the journal says so.
+- **Your own later edits move the lock forward.** Each command that notices you changed the file again records the new content as the protected one and restarts the expiry clock.
+- **A lock ends** when you `sb save` it, when you put the file back the way it was saved (nothing left to protect), or after an hour of inactivity (`SB_LOCK_TTL`, default 3600 seconds).
+- **Expiry loses nothing.** The abandoned edits are auto-saved as a commit in the *owner's* name, then auto-reverted — in history and on disk — so the shared tree returns to the state the owner found it in. The auto-save hash is printed and journaled: `sb restore <hash>` brings the work back.
+- **Merges never clobber locked work.** A merge that would change a file someone else has locked is refused; `sb merge <branch> -i` proceeds around it as a recorded partial merge. Switches, restores, undos, and checkouts all leave locked files untouched, and `ensure_clean` doesn't count them as your unsaved changes.
+- **`sb locks`** shows who holds what and what content they are protecting. `sb unlock` releases yours; `sb unlock --force` releases someone else's, journaled with the prior owner's name.
+
+Because expiry auto-saves are *preservation* commits, they store the bytes verbatim rather than redacting them: redacting and then reverting the disk would destroy the only copy of a live credential. If such a snapshot contains recognizable secrets, sandbox says so loudly and flags `secrets-present` in the journal (Section 8).
 
 ### Who gets the lock
 
-A file on disk carries no record of who edited it, so a lock found at scan time must not simply go to whoever ran the scan. If Alice edits and Bob runs `sb status`, Bob must not become the owner of Alice's edit. The signal sandbox uses is the file's owner uid: each teammate writes as their own OS account. sandbox keeps a uid → identity registry (every sandbox command anyone runs in shared mode records which OS account maps to which `sb who` identity) and locks each discovered edit to the account that owns the file. Someone who has never run sandbox still gets correct locks under their system account name, and expired-lock auto-saves are committed under the real editor's name.
+A file on disk carries no record of who edited it, so a lock found at scan time must not simply go to whoever ran the scan. If Alice edits and Bob runs `sb status`, Bob must not become the owner of Alice's edit. The signal sandbox uses is the file's owner uid: each teammate writes as their own OS account. sandbox keeps a uid → identity registry (every sandbox command anyone runs records which OS account maps to which `sb who` identity) and locks each discovered edit to the account that owns the file. Someone who has never run sandbox still gets correct locks under their system account name, and expired-lock auto-saves are committed under the real editor's name.
 
-Where the signal doesn't exist, attribution falls back to the invoking user: deletions (nothing left to stat) and uid-squashing network mounts. One editor-dependent detail: editors that save by write-temp-then-rename (most IDEs) make the editor the file's owner, so attribution is exact; an editor that truncates in place leaves the original creator as owner. New files always attribute correctly. Saving promptly closes the window either way.
+Where the signal doesn't exist, attribution falls back to the invoking user: deletions (nothing left to stat), Windows, uid-squashing network mounts, and one login shared by several sb identities. One editor-dependent detail: editors that save by write-temp-then-rename (most IDEs) make the editor the file's owner, so attribution is exact; an editor that truncates in place leaves the original creator as owner. New files always attribute correctly. Saving promptly closes the window either way.
 
-### Where shared mode belongs
+### Where shared editing belongs
 
-Shared mode is designed for one machine with multiple user accounts, or a directly attached shared disk. The store is SQLite in WAL mode, and SQLite's documentation is explicit that WAL does not work reliably over NFS or SMB mounts, because file locking on network filesystems is broken in ways no application can compensate for. If your shared drive is a network mount, treat shared mode as unsupported there and move work with `.sbox` archives instead.
+It is designed for one machine with multiple user accounts, or a directly attached shared disk. The store is SQLite in WAL mode, and SQLite's documentation is explicit that WAL does not work reliably over NFS or SMB mounts, because file locking on network filesystems is broken in ways no application can compensate for. If your shared drive is a network mount, treat multi-user use as unsupported there and move work with `.sbox` archives instead.
 
 ---
 
@@ -381,14 +406,14 @@ Put executable scripts in these folders. They are ordinary tracked files, so the
 
 ```
 sb-tests/
-  pre-save/       runs before every save (shared-mode saves included)
+  pre-save/       runs before every save
   pre-merge/      runs before every merge (including fast-forwards)
   pre-publish/    runs before every release
 ```
 
 Scripts run sorted by name (use prefixes: `10-lint.sh`, `20-unit.py`), each inside a pristine temporary checkout of the exact candidate tree:
 
-- A pre-save gate sees your candidate files in a clean directory, so nothing ignored or untracked leaks in. In shared mode it sees the exact merged tree your partial save will produce.
+- A pre-save gate sees your candidate files in a clean directory, so nothing ignored or untracked leaks in. It sees the exact tree your save will produce, including any redactions and excluding other people's locked files.
 - A pre-merge gate sees the merged result, and discovers its scripts from the merged tree, so a merge that changes the tests runs the new tests.
 - A pre-publish gate sees exactly the tree being released, and the release record carries the content hashes of the scripts that ran.
 
@@ -429,7 +454,7 @@ Keep pre-save gates fast (seconds: syntax, lint, quick unit tests) so saving sta
 
 ---
 
-## 8. The secret scanner
+## 8. Secrets and redaction
 
 The most common irreversible mistake in version control is committing a credential; history is permanent, and rotating a leaked key is an incident. sandbox scans every file being added or modified, at save time, for:
 
@@ -442,13 +467,20 @@ The most common irreversible mistake in version control is committing a credenti
 - JWTs
 - Generic assignments like `password = "…"` or `api_key: '…'` with long quoted values
 
-Findings block the save (exit `2`) with file, line number, and pattern name. In order of preference:
+### What happens when one is found
 
-1. Remove the secret; load it from the environment or an ignored config file.
-2. Ignore the file: `sb ignore .env`, then save.
-3. Override with `sb save "msg" --allow-secrets` when it's a false positive. The override is journaled.
+The credential is replaced with `<REDACTED>` in the blob that gets committed. **Your file on disk is never touched** — the code you are running still has its key, and the save still happens. sandbox prints what it redacted and where, and the journal entry for that save carries `redacted` plus the list of files, so the substitution is on the record rather than silent.
 
-The scan applies to shared-mode saves too. Binary files and files over 1 MB are skipped. Caveats: pattern matching catches known credential shapes, not every secret, and only files touched by the current save are scanned. Treat it as a seatbelt, not a substitute for keeping secrets out of tracked files.
+A private key is redacted as a whole block, from `-----BEGIN` through the matching `-----END` (or end of file for a truncated block), because the key material is the base64 body *below* the line the scanner flags.
+
+Two cases don't redact:
+
+- **`--allow-secrets`** commits the file verbatim, journaled as `secrets-override`. Use it for false positives.
+- **A file that isn't clean UTF-8** cannot be rewritten without mangling its bytes, so a credential inside one blocks the save (exit `2`) instead. Remove the secret, `sb ignore` the file, or override.
+
+Expired-lock auto-saves are the deliberate exception described in Section 6: they preserve bytes verbatim, warn loudly, and flag `secrets-present` in the journal.
+
+Redaction is a seatbelt, not a substitute for keeping secrets out of tracked files. The durable fix is to move the credential to an environment variable or an ignored config file (`sb ignore .env`) so it stops recurring. Binary files and files over 1 MB are skipped, pattern matching catches known credential shapes rather than every secret, and only files touched by the current save are scanned.
 
 ---
 
@@ -458,7 +490,7 @@ sandbox makes three promises. Each comes with its mechanism, what it defends aga
 
 ### Promise 1 — Integrity: what you get back is what you put in
 
-Mechanism: every object is stored under the SHA-256 of its content and re-hashed on every read. Every save embeds its tree hash and parent hashes, so each save transitively fixes the exact bytes of every file in it and every save before it. Every operation commits as one SQLite transaction (WAL mode, `synchronous=FULL` by default). Working-folder writes use exclusive randomized temp files, fsync, and atomic rename through no-follow parent directory descriptors; this applies to checkout, switch, merge, restore, and `undo -p`. A crash between the database and the working folder surfaces as ordinary unsaved changes in `status`.
+Mechanism: every object is stored under the SHA-256 of its content and re-hashed on every read. Every save embeds its tree hash and parent hashes, so each save transitively fixes the exact bytes of every file in it and every save before it. Every operation commits as one SQLite transaction (WAL mode, `synchronous=FULL` by default). Working-folder writes use exclusive randomized temp files, fsync, and atomic rename through no-follow parent directory descriptors; this applies to checkout, switch, merge, restore, `undo -p`, lock reverts, and `salvage`. A crash between the database and the working folder surfaces as ordinary unsaved changes in `status`.
 
 Defends against: disk corruption, torn and partial writes, power loss mid-operation, truncated or bit-flipped objects, malformed objects that hash correctly but don't parse, crafted trees attempting path traversal on checkout, and symlinks attempting to redirect any write outside the repository.
 
@@ -466,29 +498,33 @@ Does not defend against: loss of the database file itself. Integrity detection i
 
 ### Promise 2 — Tamper evidence: changes made behind sandbox's back are detectable
 
-Mechanism: the hash-chained journal. Every operation appends an entry whose link is `SHA-256(canonical entry ‖ previous link)`, rooted in a random per-repository ID. `sb verify` recomputes the chain and cross-checks every branch tip against the journal's record, flagging tips that were moved, branches that were deleted, and refs that were injected. Gate bypasses are part of the chained record.
+Mechanism: the hash-chained journal. Every operation appends an entry whose link is `SHA-256(canonical entry ‖ previous link)`, rooted in a random per-repository ID. `sb verify` recomputes the chain and cross-checks every branch tip against the journal's record, flagging tips that were moved, branches that were deleted, and refs that were injected. Gate bypasses and redactions are part of the chained record.
 
 Defends against: editing or deleting journal entries; manipulating refs via direct database access; replacing objects; modification by anything that isn't sb.
 
 Does not defend against: an attacker with write access to the database and knowledge of sandbox's format can rewrite the entire store into a new, internally consistent history. With no secret material anywhere, internal consistency is recomputable by anyone; this is inherent to keyless designs. Anchors (Section 10) close the gap: a chain-head value recorded outside the machine cannot be reproduced by any rewrite. What sandbox will not do is ship the appearance of cryptographic authenticity (signatures, badges) without the key management that would make it meaningful.
 
-### Promise 3 — Leak prevention: credentials are stopped before they enter permanent history
+### Promise 3 — Leak prevention: credentials don't enter permanent history in the clear
 
-Mechanism: the save-time secret scanner (Section 8), on by default, overridable only explicitly, overrides journaled.
+Mechanism: the save-time redaction pass (Section 8), on by default, overridable only explicitly, both the redaction and the override journaled. Files that cannot be redacted faithfully block the save instead.
 
 Defends against: accidental commits of recognizable credentials.
 
-Does not defend against: unrecognizable secrets, or secrets already in older saves.
+Does not defend against: unrecognizable secrets, secrets already in older saves, or secrets in binary and oversized files, which are skipped.
+
+### What locks are and are not
+
+Locks are a coordination mechanism, not access control. They stop a second writer's version from becoming the version of record — on disk and in history — and they make sure nothing typed is destroyed on the way. They do not stop anyone with write access from opening the file, and they do not survive someone bypassing sandbox entirely. `sb unlock --force` is available to everyone, and journaled.
 
 ### What sandbox does not claim
 
 - Confidentiality of the store. The database is created `0600`; full-disk encryption is the right layer for confidentiality at rest. (`.sbox` archives are encrypted; that covers transport and cold storage.)
-- Authentication. The author on a save is attribution for humans reading history. Shared mode's uid-based lock attribution improves accuracy; it is still not authentication.
+- Authentication. The author on a save is attribution for humans reading history. uid-based lock attribution improves accuracy; it is still not authentication.
 - Access control. sandbox is a local tool; file permissions are the access control.
 
 ### Why the cryptography was removed
 
-An earlier design signed every commit with Ed25519, with a hand-rolled pure-Python fallback. That fails security review on three grounds: hand-rolled signature code is where implementation vulnerabilities live; keys with no management story (generated silently, stored in a dotfile, never rotated or bound to anything a verifier could trust) prove only that some key signed something; and a claim users trust more than its mechanism deserves is worse than no claim. The same standard was applied in 1.2 to the embedded encryption module, which carried an unused "asymmetric" mode whose construction did not deliver public-key security; it was deleted rather than documented around. Every property the removed code was supposed to provide is covered by the re-hashing, the chain, the ref cross-check, and anchors.
+An earlier design signed every commit with Ed25519, with a hand-rolled pure-Python fallback. That fails security review on three grounds: hand-rolled signature code is where implementation vulnerabilities live; keys with no management story (generated silently, stored in a dotfile, never rotated or bound to anything a verifier could trust) prove only that some key signed something; and a claim users trust more than its mechanism deserves is worse than no claim. The same standard was applied to the embedded encryption module, which carried an unused "asymmetric" mode whose construction did not deliver public-key security; it was deleted rather than documented around. Every property the removed code was supposed to provide is covered by the re-hashing, the chain, the ref cross-check, and anchors.
 
 ---
 
@@ -523,9 +559,10 @@ Anchors also work as bookmarks: `sb restore <anchor>` returns the branch's conte
 ```bash
 sb pack -k "my-strong-pass-key"                   # -> <foldername>.sbox
 sb pack release.sbox -k "my-strong-pass-key"      # choose the output name
+sb pack release.sbox                              # prompts for the pass-key instead
 ```
 
-`-f`/`--files-only` seals just the current save's files, without history.
+The pass-key comes from `-k`, else `SB_PASSKEY`, else an interactive prompt (with confirmation when sealing). `-k` is convenient but exposes the key to shell history and process listings; the prompt and the environment variable avoid that. `-f`/`--files-only` seals just the current save's files, without history.
 
 To restore, on any machine with sandbox, fully offline:
 
@@ -554,7 +591,7 @@ The manifest lives inside the encrypted blob, so an archive reveals nothing (aut
 
 ### The encryption: vox
 
-sandbox's integrity model uses no cryptographic keys (Section 9); nothing in save, merge, verify, the journal, or anchors depends on a secret. Archive confidentiality is a separate concern, handled by [vox](https://jts.gg/vox) (v1.7.3, symmetric core), a small single-file encryption module embedded inside sandbox and loaded into memory only while `pack`, `unpack`, or `export -k` runs. No separate file, no install step, no network. The unused legacy asymmetric interface was removed from the embedded copy in 1.2.
+sandbox's integrity model uses no cryptographic keys (Section 9); nothing in save, merge, verify, the journal, or anchors depends on a secret. Archive confidentiality is a separate concern, handled by [vox](https://jts.gg/vox) (v1.7.3, symmetric core), a small single-file encryption module embedded inside sandbox and loaded into memory only while `pack`, `unpack`, or `export -k` runs. No separate file, no install step, no network. The unused legacy asymmetric interface is not present in the embedded copy.
 
 vox is a misuse-resistant authenticated cipher: an SIV-style AEAD built on HMAC-SHA512, with PBKDF2-HMAC-SHA512 key stretching at 300,000 iterations. Since sbox format v2, a random per-archive salt is mixed into key derivation, so two archives sealed with the same passphrase use different keys and a password guess can't be amortized across archives. Two practical consequences:
 
@@ -583,7 +620,9 @@ The entire repository is one SQLite database: `.sb/sandbox.db`, in WAL mode, cre
 | `refs` | `name → commit hash`: branch tips (empty string = branch with no saves) |
 | `journal` | `seq, ts, op, detail(JSON), prev, link`: the append-only hash chain |
 | `statcache` | `path → size, mtime, ctime, inode, hash`: change detection without re-reading |
-| `locks` | `path → owner, email, since, base`: shared-mode per-file locks |
+| `locks` | `path → owner, email, since, base, held, mode, uid`: per-file content locks |
+
+In `locks`, `held` is the hash of the content the holder is protecting (or a `deleted` marker when they removed the file), `mode` is the file mode to restore it with, and `uid` is the OS account the holder writes as. A lock recorded by an older version has an empty `held` and adopts whatever is on disk the first time 1.3 sees it.
 
 ### Object encodings
 
@@ -595,7 +634,7 @@ An object's hash is `SHA-256("<kind> <length>\0" + data)`. Trees and commits are
 
 ### What write paths guarantee
 
-Tree entry names are validated on read (no `/`, `\`, NUL, `.`, `..`, empty, or `.sb`), so a hostile tree can't write outside the repository. Every worktree write (checkout, switch, merge, restore, `undo -p`, archive extraction) goes through a parent directory opened with no-follow semantics, an exclusively-created randomized temp file, a complete-write loop, fsync, and atomic rename. Archive outputs (`pack`, `export -k`) use the same discipline. Directory pruning never touches `.sb`.
+Tree entry names are validated on read (no `/`, `\`, NUL, `.`, `..`, empty, or `.sb`), so a hostile tree can't write outside the repository. Every worktree write (checkout, switch, merge, restore, `undo -p`, lock reverts, archive extraction) goes through a parent directory opened with no-follow semantics, an exclusively-created randomized temp file, a complete-write loop, fsync, and atomic rename. Archive outputs (`pack`, `export -k`) use the same discipline. Directory pruning never touches `.sb`.
 
 ---
 
@@ -622,7 +661,7 @@ Two behaviors to know, the second being a real footgun: ignored files are invisi
 
 **Solo project, straight line.** `sb init`, then work / `sb status` / `sb save` in a loop. Add a pre-save syntax gate (`sb test new pre-save 10-syntax`) on day one.
 
-**Safe experiment.** `sb branch spike && sb switch spike`, hack with saves as checkpoints. If it works: `sb switch main && sb merge spike`. If it doesn't: switch back and never merge.
+**Safe experiment.** `sb branch spike && sb switch spike` — the branch already holds your folder as its first save, so there is nothing to set up. Hack with saves as checkpoints. If it works: `sb switch main && sb merge spike`. If it doesn't: switch back and never merge.
 
 **"I broke it ten minutes ago."** `sb diff` to see the damage; `sb undo -p <file>` to reclaim one file from the last save; `sb undo` to revert the whole last save.
 
@@ -630,7 +669,9 @@ Two behaviors to know, the second being a real footgun: ignored files are invisi
 
 **"It worked last Tuesday."** Find last Tuesday (an anchor you noted, a save in `sb log`, or a release label) and `sb restore <it>`.
 
-**Small team, one machine or one attached disk.** `sb shared on`. Everyone works in the same folder; editing a file locks it to the actual editor; `sb save` commits only your files; `sb locks` shows who holds what; expired locks auto-save in their owner's name. Merges refuse to clobber locked work; `sb merge feat -i` proceeds around it as a recorded partial merge and completes on re-merge.
+**Small team, one machine or one attached disk.** Everyone works in the same folder. Editing a file locks it to the actual editor; your version of a locked file stays put and anyone else's edit to it is put back (recoverable with `sb salvage`); `sb save` commits only your files; `sb locks` shows who holds what; abandoned locks auto-save in their owner's name after an hour and free themselves. Merges refuse to clobber locked work; `sb merge feat -i` proceeds around it as a recorded partial merge and completes on re-merge.
+
+**"My edit got reverted."** The file belongs to someone else's lock. `sb journal` shows the `lock-revert` entry with the hash of what you wrote; `sb salvage <hash> mine.txt` gets it back, and you can hand it to the lock holder or apply it after they save.
 
 **Release with a paper trail.** Keep the real suite in `sb-tests/pre-publish/`. Ship with `sb publish v1.4`: sandbox verifies the store, runs the suite against a clean checkout of exactly what's shipping, and journals the record, including the content hashes of the gate scripts that ran. `sb publish -l` is the release history.
 
@@ -666,14 +707,15 @@ Rolling back is `sb export <older-label>` and the same `-i` drop.
 | Detached HEAD | impossible | routine source of confusion |
 | Destroying history | no command does it | `reset --hard`, `push -f`, dropped stashes, expired reflog |
 | Undo | `sb undo`, a new save, reversible | `revert` vs `reset` vs `restore` vs `checkout` |
+| New branch | born with a save of your folder | a pointer; content comes later |
 | Repository format | one crash-safe SQLite file | thousands of loose files + packfiles + refs + index |
 | Operation audit log | hash-chained journal of every operation, bypasses included, cross-checked vs refs | reflog: per-machine, expiring, mutable, unchained |
 | Tamper evidence | chain + tip cross-check + external anchors | commit DAG only; refs/reflog unprotected |
-| Secret prevention | built into every save, overrides journaled | third-party hooks you must install |
+| Secret prevention | redacted at save time by default, journaled | third-party hooks you must install |
 | Test enforcement | versioned gates on clean checkouts, on by default | hooks: unversioned, per-clone, easily absent |
 | Renames | exact-content detection in status/diff/log | similarity-based detection, rename-aware merges |
 | Merge conflicts | auto-merge non-overlap; on conflict, stops cleanly, worktree untouched | conflict markers + in-progress merge state |
-| Small-team sharing | shared mode: one repo, per-file locks | clone/push/pull, remotes |
+| Small-team sharing | one repo, per-file content locks, always on | clone/push/pull, remotes |
 | Remotes / distributed collaboration | not yet (roadmap) | git's core strength |
 | Platform | Linux / macOS / WSL | everywhere |
 | Ecosystem | one file, zero deps | vast |
@@ -689,8 +731,9 @@ Summary: git is a distributed collaboration system you can also use alone; sandb
 | `SB_NAME` | attribution name for saves (overrides `sb who`) | profile, else OS username |
 | `SB_EMAIL` | attribution email | profile, else `<name>@local` |
 | `SB_HOME` | folder for the global profile | `~/.config/sandbox` |
+| `SB_PASSKEY` | pass-key for `pack` / `unpack` / `export -k` when `-k` is absent | prompt |
 | `SB_TEST_TIMEOUT` | seconds allowed per test script | `120` |
-| `SB_LOCK_TTL` | seconds a shared-mode lock lives before auto-save + release | `3600` |
+| `SB_LOCK_TTL` | seconds a lock survives without activity before auto-save + release | `3600` |
 
 Inside test scripts, sandbox also exports `SB_STAGE`, `SB_BRANCH`, `SB_COMMIT`, `SB_REPO` (Section 7).
 
@@ -702,7 +745,7 @@ Inside test scripts, sandbox also exports `SB_STAGE`, `SB_BRANCH`, `SB_COMMIT`, 
 |---|---|
 | `0` | success |
 | `1` | usage or state error (not a repo, unsaved changes, unknown branch, bad arguments, non-empty unpack destination, corrupt object hit mid-operation, file-system error, …) |
-| `2` | a gate stopped you: secrets found, test gates failed, merge conflicts, or `verify` found problems |
+| `2` | a gate stopped you: unredactable secrets, failed test gates, merge conflicts, or `verify` found problems |
 | `130` | interrupted (Ctrl-C) |
 
 The split is script-friendly: `2` means sandbox worked correctly and blocked something on purpose, so automation can tell "fix your command" from "fix your content."
@@ -711,8 +754,23 @@ The split is script-friendly: `2` means sandbox worked correctly and blocked som
 
 ## 18. FAQ
 
+**Why didn't my secret block the save?**
+Because 1.3 redacts instead of blocking. The credential is replaced with `<REDACTED>` in the committed blob, your file on disk is untouched, and the journal records which files were redacted. Only a file that can't be rewritten faithfully (not clean UTF-8) still blocks. Section 8.
+
+**Someone else has a file locked and my edit keeps reverting. Where did my work go?**
+Into the object store. The revert is journaled as `lock-revert` with the hash of exactly what you wrote; `sb salvage <hash> [<path>]` writes it back out to any filename you like. Nothing you typed is destroyed — sandbox just refuses to let a second writer's copy become the version of record.
+
+**Can I turn locking off?**
+No. Shared operation is structural in 1.3, not a setting. In a repository with one user it never does anything visible: you are always your own lock holder, and your own edits move your locks forward.
+
+**Why does `sb branch` create a save?**
+So a branch is never an empty name. It can be switched to, tested, exported, and merged the moment it exists, and there is no "save something first" step before a merge. If the branch you were on had no saves, it is seeded with the same commit so the two share a base.
+
+**I merged a branch that doesn't have my file, and the file survived. Bug?**
+Intended. In a three-way merge a file that only your side has never existed in the base, which reads as "only we changed it," so it is kept. Deleting it would mean inventing a deletion the other branch never made. A file is removed only when it existed in the base and the other side deleted it.
+
 **Where did the signatures go? Is sandbox less secure now?**
-The Ed25519 signing was removed deliberately; Section 9 has the full reasoning. Keys with no management story prove nothing, and a hand-rolled fallback implementation is a liability. The properties the signatures actually provided (integrity, tamper evidence) are covered by content re-hashing, the journal chain, the ref cross-check, and anchors. The same standard removed the encryption module's unused asymmetric mode in 1.2.
+The Ed25519 signing was removed deliberately; Section 9 has the full reasoning. Keys with no management story prove nothing, and a hand-rolled fallback implementation is a liability. The properties the signatures actually provided (integrity, tamper evidence) are covered by content re-hashing, the journal chain, the ref cross-check, and anchors.
 
 **Is SHA-256 "cryptography"? I asked for none.**
 It's a hash function from Python's standard library used as a content fingerprint. No keys, no signatures, no third-party crypto code. Content addressing, integrity checking, and the journal are all built on it.
@@ -721,10 +779,10 @@ It's a hash function from Python's standard library used as a content fingerprin
 Copy `.sb/sandbox.db` (any time sandbox isn't mid-command; WAL makes even that forgiving), copy the whole project folder, or `sb pack` for an encrypted single-file backup. After restoring, run `sb verify`.
 
 **Can I have partial commits, like `git add -p`?**
-No, by design: a save is exactly your working tree, which is what makes "the tests passed on this save" meaningful. Two unrelated changes belong on two branches or in two saves. Shared mode's your-files-only save is the one exception, and it exists to protect other people's in-progress work.
+No, by design: a save is exactly your working tree, which is what makes "the tests passed on this save" meaningful. Two unrelated changes belong on two branches or in two saves. The your-files-only save is the one exception, and it exists to protect other people's in-progress work.
 
 **What about large or binary files?**
-Stored (zlib-compressed) and versioned like anything else; `diff` summarizes them in one line and the secret scanner skips them. Every version of a large file is kept in full; there is no delta compression yet, so frequently-changing large binaries grow the store quickly.
+Stored (zlib-compressed) and versioned like anything else; `diff` summarizes them in one line and the redaction pass skips them. Every version of a large file is kept in full; there is no delta compression yet, so frequently-changing large binaries grow the store quickly.
 
 **Does rename detection catch a file I moved and edited?**
 No. Detection is exact-content only, so a moved-and-edited file shows as an add plus a delete. Similarity-based detection is on the roadmap.
@@ -755,15 +813,21 @@ Alice. Locks are attributed to the file's owner on disk, resolved through the ui
 
 **`error: sb <command>: unrecognized arguments: …` / `missing: …`** — the flag or argument doesn't exist for that command; the correct usage line is printed below the error.
 
-**`error: you have unsaved changes`** — `switch`, `merge`, `undo`, `restore`, and `publish` refuse to run over uncommitted work. `sb save "wip"` (saves are cheap, undo is free), or `sb undo -p <path>` for changes you want gone.
+**`error: you have unsaved changes`** — `switch`, `merge`, `undo`, `restore`, and `publish` refuse to run over uncommitted work. `sb save "wip"` (saves are cheap, undo is free), or `sb undo -p <path>` for changes you want gone. Other people's locked files never trigger this.
 
-**`merge blocked — it would change files locked by others`** — shared mode protecting a teammate's in-progress edit. Wait, ask them to save, or `sb merge <branch> -i` to proceed around those files as a recorded partial merge.
+**`reverted N file(s) to their lock holders' versions`** — you edited files someone else holds locks on. Their versions are back on disk; yours are stored, and the message and journal give you the hashes for `sb salvage`.
+
+**`nothing of yours to save` / `N file(s) belong to other people's locks`** — everything you changed is locked by someone else, so there was nothing for your save to commit. Wait for them to save, or ask them to.
+
+**`merge blocked — it would change files locked by others`** — protecting a teammate's in-progress edit. Wait, ask them to save, or `sb merge <branch> -i` to proceed around those files as a recorded partial merge.
+
+**`save blocked — secrets in files that cannot be safely redacted (not clean UTF-8)`** — the file holds a credential but isn't text sandbox can rewrite without corrupting it. Remove the secret, `sb ignore` the file, or `--allow-secrets` (journaled). Section 8.
+
+**`secrets redacted in the save (working files untouched)`** — not an error. The save happened; history holds `<REDACTED>` and your files are unchanged. Move the credential to an environment variable or an ignored file so it stops recurring.
 
 **`error: <folder> is not empty — unpack into a fresh folder`** — unpack never writes into a destination that already contains anything. Pick a fresh folder, or add `-i` to overwrite matching files on purpose.
 
 **`the archive's repository failed verification — nothing was written`** — the store inside the `.sbox` is damaged or was tampered with; unpack refused before touching the destination. Get a good copy of the archive.
-
-**`save blocked — possible secrets detected`** — Section 8. Remove the secret, ignore the file, or `--allow-secrets` if you're sure (journaled).
 
 **`pre-save tests failed — save blocked`** — the failing script's last 15 lines are printed above the error. Reproduce with `sb test pre-save`. Override once with `--no-verify` (journaled), then fix the gate.
 
@@ -777,19 +841,21 @@ Alice. Locks are attributed to the file's owner on disk, resolved through the ui
 
 **`file system error: …`** — a permission or disk problem outside sandbox's control, reported cleanly.
 
-**A file isn't being saved** — it matches an ignore rule. Check `.sbignore` and the built-in defaults (Section 13). Symlinks are skipped with a printed note.
+**A file isn't being saved** — it matches an ignore rule, or someone else holds a lock on it (`sb status` marks those `(theirs)`). Check `.sbignore` and the built-in defaults (Section 13). Symlinks are skipped with a printed note.
 
 ---
 
 ## 20. Known limitations and roadmap
 
-- **POSIX only.** Linux, macOS, WSL. The symlink-safe write machinery relies on directory descriptors Windows doesn't provide; supporting Windows by weakening those guarantees isn't on the table, so it waits until it can be done properly.
+- **POSIX only.** Linux, macOS, WSL. The symlink-safe write machinery relies on directory descriptors Windows doesn't provide; supporting Windows by weakening those guarantees isn't on the table, so it waits until it can be done properly. (Lock attribution also loses its uid signal there and falls back to the invoking user.)
 - **No live remotes yet.** Repositories move between machines as encrypted `.sbox` archives, which works but is manual. Journal-first sync is the top roadmap item.
-- **Shared mode wants a local disk.** SQLite WAL is not reliable over NFS/SMB mounts (Section 6). One machine or a directly attached disk is supported; for network mounts, use archives.
+- **Shared editing wants a local disk.** SQLite WAL is not reliable over NFS/SMB mounts (Section 6). One machine or a directly attached disk is supported; for network mounts, use archives.
+- **Locks are enforced by sandbox, not by the filesystem.** They are evaluated when a command runs, so a foreign edit lives on disk until the next command puts it back. Nothing is lost either way, but a locked file is not read-only to your editor.
 - **No symlink tracking** (skipped with a note).
 - **Whole-file storage.** zlib-compressed but not delta-compressed; heavy for large, frequently-changing binaries. Archives are also held in memory while sealing/opening: fine to a few GB, not streaming.
 - **Rename detection is exact-content only.** Moved-and-edited files show as add + delete; merges are not rename-aware.
 - **Conservative merges.** Adjacent-line edits and same-point insertions conflict rather than merge, and conflicts are resolved on a branch rather than via in-worktree conflict markers.
+- **Redaction is pattern-based.** It catches known credential shapes in text files under 1 MB, and only in files the current save touches.
 - **No branch rename, no per-save tags** yet.
 - **`unpack -i` keeps no backup.**
 - **Anchors are manual.** Automatic anchoring is on the roadmap.
