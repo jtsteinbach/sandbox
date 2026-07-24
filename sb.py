@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
-"""
-sandbox (sb) — version control in a single file.
-
-version   1.3
-author    jts.gg/sandbox
-"""
+# sandbox (sb): version control in a single file.
+# version 1.3 · jts.gg/sandbox
 
 import sys, os, io, json, time, zlib, hashlib, fnmatch, difflib, re
 import argparse, contextlib
@@ -17,28 +13,26 @@ FORMAT_VERSION = 1
 SB_DIR = ".sb"
 DB_NAME = "sandbox.db"
 
-# every journal op that moves a branch tip — verify cross-checks refs
-# against these, and _journal_tips_at replays them
+# journal ops that move a branch tip. verify checks refs against these
 REF_OPS = ("save", "merge", "undo", "restore", "branch", "ref",
            "autosave")
 
-# ---------------------------------------------------------------- output ----
-# A deliberately small, calm palette: white (default / bold), gray (dim),
-# and one amber accent. Red is reserved strictly for genuine failures.
+# output
+# three colors: bold white, dim gray, one amber accent. red means failure
 def _c(code, s):
     return f"\033[{code}m{s}\033[0m" if sys.stdout.isatty() else str(s)
-def dim(s):    return _c("2", s)             # gray  — secondary / chrome
-def bold(s):   return _c("1", s)             # white — names, verbs, emphasis
-def amber(s):  return _c("38;5;215", s)      # amber — connectors, ids, checks
-def red(s):    return _c("31", s)            # red   — errors and failures only
-# on-theme aliases so every call site stays within the palette
+def dim(s):    return _c("2", s)             # gray: secondary text
+def bold(s):   return _c("1", s)             # white: names and emphasis
+def amber(s):  return _c("38;5;215", s)      # amber: connectors and ids
+def red(s):    return _c("31", s)            # red: failures only
+# aliases, so call sites stay inside the palette
 def green(s):  return bold(s)                # success reads as bold white
 def yellow(s): return amber(s)               # highlights / ids read as amber
 def cyan(s):   return amber(s)               # paths / ids read as amber
 RULE = "\u2500" * 34
 
 def tree_print(lines, indent="  "):
-    """Print lines under the previous message with light connector glyphs."""
+    # Print lines under the previous message with light connector glyphs.
     for i, line in enumerate(lines):
         conn = "\u2514\u2500\u2500\u2500 " if i == len(lines) - 1 else "\u251c\u2500\u2500\u2500 "
         print(indent + amber(conn) + line)
@@ -54,24 +48,26 @@ def short(h):
     return h[:10] if h else "-"
 
 class CorruptObject(Exception):
-    """An on-disk object failed its integrity check."""
+    # a stored object failed its integrity check
+    pass
 
 class TamperedJournal(Exception):
-    """The journal hash chain does not verify."""
+    # The journal hash chain does not verify.
+    pass
 
-# ------------------------------------------------------------ hashing -------
+# hashing
 def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 def canonical(obj) -> bytes:
-    """Deterministic JSON encoding used for trees, commits and journal links."""
+    # Deterministic JSON encoding used for trees, commits and journal links.
     return json.dumps(obj, sort_keys=True, separators=(",", ":"),
                       ensure_ascii=False).encode()
 
 def hash_obj(kind: str, data: bytes) -> str:
     return sha256_hex(f"{kind} {len(data)}\0".encode() + data)
 
-# ------------------------------------------------------------- the store ----
+# the store
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -120,7 +116,7 @@ def find_repo(start="."):
     while True:
         if (p / SB_DIR / DB_NAME).is_file():
             return p
-        if (p / SB_DIR).is_dir():          # legacy loose-object layout
+        if (p / SB_DIR).is_dir():          # legacy loose file layout
             if (p / SB_DIR / "objects").is_dir():
                 die(f"{p / SB_DIR} uses the old loose-file format.\n"
                     "       this version stores everything in one crash-safe "
@@ -130,7 +126,7 @@ def find_repo(start="."):
             return None
         p = p.parent
 
-_UNSET = object()   # sentinel: "caller passed no expected value" for CAS
+_UNSET = object()   # sentinel: no expected value given, so no CAS
 
 class Repo:
     def __init__(self, root: Path, create=False):
@@ -143,10 +139,8 @@ class Repo:
         self.db = sqlite3.connect(db_path, isolation_level=None, timeout=30.0)
         self._tx = 0                     # transaction nesting depth
         self.db.execute("PRAGMA journal_mode=WAL")
-        # FULL by default: the newest committed transaction survives OS crash
-        # and power loss, at a small write cost. 'sb durability normal'
-        # trades that for speed (still crash-safe, may lose the last commit on
-        # power loss). Applied after open once meta is readable.
+        # FULL keeps the newest commit through power loss. normal is faster
+        # and still crash safe, but may lose it
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("PRAGMA busy_timeout=30000")
@@ -182,9 +176,8 @@ class Repo:
 
     @contextlib.contextmanager
     def transaction(self):
-        """One atomic unit of work. Nested calls join the outermost
-        transaction, so a whole command commits or rolls back together.
-        Any exception, including sys.exit, triggers the rollback."""
+        # one atomic unit of work. nested calls join the outermost one, so a
+        # command commits or rolls back whole. any exception rolls it back
         if self._tx == 0:
             self.db.execute("BEGIN IMMEDIATE")
         self._tx += 1
@@ -201,9 +194,7 @@ class Repo:
                 self.db.execute("COMMIT")
 
     def _migrate_statcache(self):
-        """Pre-1.1 stores keyed the stat cache on (size, mtime) only. Add
-        the ctime and inode columns and drop the stale rows; the only cost
-        is one full re-read on the next command."""
+        # add the ctime and inode columns to an older cache, drop stale rows
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(statcache)")}
         if "ctime" in cols and "ino" in cols:
             return
@@ -217,12 +208,8 @@ class Repo:
             self.db.execute("DELETE FROM statcache")
 
     def _migrate_locks(self):
-        """Create the locks table on stores made before shared-lock support,
-        and add the columns the 1.4 content-preserving lock model needs:
-        `held` (the exact content the holder is protecting), its file mode,
-        and the OS account the holder writes as. A pre-1.4 lock has an empty
-        `held`; the first enforcement pass adopts whatever is on disk rather
-        than guessing, so nothing is reverted on the strength of a blank."""
+        # add the columns a content lock needs: held, its mode, its uid.
+        # an older lock has no held, so enforcement adopts what is on disk
         with self.transaction():
             self.db.execute(
                 "CREATE TABLE IF NOT EXISTS locks ("
@@ -240,7 +227,7 @@ class Repo:
                 self.db.execute("ALTER TABLE locks ADD COLUMN "
                                 "uid INTEGER NOT NULL DEFAULT -1")
 
-    # ---- meta ----
+    # meta
     def meta(self, key, default=None):
         row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
         return row[0] if row else default
@@ -252,7 +239,7 @@ class Repo:
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (key, str(value)))
 
-    # ---- object store ----
+    # object store
     def put(self, kind: str, data: bytes) -> str:
         h = hash_obj(kind, data)
         with self.transaction():
@@ -266,8 +253,7 @@ class Repo:
             "SELECT 1 FROM objects WHERE hash=?", (h,)).fetchone() is not None
 
     def get(self, h: str):
-        """Return (kind, data). KeyError if missing, CorruptObject if damaged.
-        Content is re-hashed on EVERY read — corruption cannot pass silently."""
+        # (kind, data). rehashed on every read, so damage cannot pass quietly
         row = self.db.execute(
             "SELECT kind, data FROM objects WHERE hash=?", (h,)).fetchone()
         if row is None:
@@ -282,7 +268,7 @@ class Repo:
         return kind, data
 
     def resolve(self, name_or_prefix: str):
-        """Branch name, or unambiguous commit-hash prefix, -> full commit hash."""
+        # branch name or unambiguous hash prefix, to a full commit hash
         row = self.db.execute(
             "SELECT hash FROM refs WHERE name=?", (name_or_prefix,)).fetchone()
         if row is not None:
@@ -298,7 +284,7 @@ class Repo:
                 die(f"'{name_or_prefix}' is ambiguous — give more characters")
         return None
 
-    # ---- refs / branch pointer ----
+    # refs / branch pointer
     def current_branch(self):
         return self.meta("branch")
 
@@ -316,13 +302,10 @@ class Repo:
 
     def update_ref(self, branch, commit_hash, op="ref", expect=_UNSET,
                    extra=None):
-        """Move a branch tip. The ref update and its journal entry commit in
-        one transaction. If `expect` is given, the move is a compare-and-swap:
-        the tip must still equal `expect` (the value the caller read before
-        doing its work), or the whole transaction aborts with a clear error.
-        This turns the 'two saves race, one silently orphans the other's
-        commit' scenario into a loud, safe failure. `extra` merges audit
-        fields (e.g. gate bypasses) into the journal entry."""
+        # move a branch tip, with its journal entry, in one transaction.
+        # expect makes it a compare and swap: the tip must still equal it or
+        # nothing happens, so racing saves fail loudly. extra adds audit
+        # fields to the journal entry
         with self.transaction():
             old = self.tip(branch)
             if expect is not _UNSET and (old or None) != (expect or None):
@@ -339,15 +322,14 @@ class Repo:
             self.journal(op, detail)
 
     def remove_ref(self, branch):
-        """Delete a branch tip. The deletion and its journal entry commit
-        in one transaction."""
+        # delete a branch tip, with its journal entry, in one transaction
         old = self.tip(branch)
         with self.transaction():
             self.db.execute("DELETE FROM refs WHERE name=?", (branch,))
             self.journal("branch-remove", {"branch": branch, "old": old or "",
                                            "new": ""})
 
-    # ---- journal: append-only, hash-chained audit log ----
+    # journal
     def chain_head(self):
         row = self.db.execute(
             "SELECT link FROM journal ORDER BY seq DESC LIMIT 1").fetchone()
@@ -377,8 +359,8 @@ class Repo:
                    "detail": d, "prev": prev, "link": link}
 
     def verify_journal(self):
-        """Recompute the hash chain. Returns (n_entries, head_link).
-        Raises TamperedJournal at the first broken link."""
+        # recompute the chain. gives (n_entries, head_link), or raises
+        # TamperedJournal at the first broken link
         prev = self.meta("repo_id", "")
         n, head = 0, prev
         for e in self.journal_entries():
@@ -397,12 +379,9 @@ class Repo:
             n += 1
         return n, head
 
-    # ---- stat cache (why status is instant on large trees) ----
-    # Keyed on size + mtime + ctime + inode. mtime can be restored from
-    # userspace (touch -d, archive extraction), so a same-size edit could
-    # slip past a (size, mtime) key; ctime cannot be set backward, and the
-    # inode changes when an editor replaces the file. A miss only means
-    # the file is re-read.
+    # stat cache
+    # keyed on size, mtime, ctime, inode. mtime alone can be forged from
+    # userspace, so ctime and inode are what catch a same size edit
     def cached_hash(self, rel, size, mtime_ns, ctime_ns, ino):
         row = self.db.execute(
             "SELECT hash FROM statcache WHERE path=? AND size=? AND mtime=? "
@@ -421,13 +400,11 @@ class Repo:
                 "mtime=excluded.mtime, ctime=excluded.ctime, "
                 "ino=excluded.ino, hash=excluded.hash", entries)
 
-    # ---- shared-edit locks ----
+    # locks
     def locks(self):
-        """All current locks:
-        {path: {owner, email, since, base, held, mode, uid}}.
-        `held` is the content hash the holder is protecting, LOCK_DELETED if
-        the holder removed the file, or "" for a pre-1.4 lock that predates
-        content tracking."""
+        # {path: {owner, email, since, base, held, mode, uid}}. held is the
+        # content being protected, LOCK_DELETED if the holder deleted it, or
+        # empty for a lock older than content tracking
         out = {}
         for path, owner, email, since, base, held, mode, uid in self.db.execute(
                 "SELECT path,owner,email,since,base,held,mode,uid FROM locks"):
@@ -448,10 +425,8 @@ class Repo:
                  -1 if uid is None else int(uid)))
 
     def update_lock_held(self, path, held, mode, touch=True):
-        """Move a lock's protected content forward — the holder edited the
-        file again. `touch` also restarts the expiry clock, so a lock times
-        out after an hour of NOT being worked on rather than an hour after
-        the first keystroke."""
+        # the holder edited again, so protect the new content. touch resets
+        # the clock, making expiry mean idle time, not total time held
         with self.transaction():
             if touch:
                 self.db.execute(
@@ -474,9 +449,8 @@ def need_repo() -> Repo:
     if not root:
         die("not inside a sandbox repository (run 'sb init')")
     repo = Repo(root)
-    # in shared mode, every command teaches the store which OS account this
-    # sb identity belongs to, so edits found on disk later can be attributed
-    # to their real author. Best-effort: never block a read-only command.
+    # record which OS account this identity uses, so later edits found on
+    # disk can be attributed. best effort, never blocks
     if shared_mode(repo):
         try:
             register_identity(repo)
@@ -484,10 +458,35 @@ def need_repo() -> Repo:
             pass
     return repo
 
-# ------------------------------------------------------------ identity ------
-# sb records WHO made each save for humans reading history. There are no
-# keys and no signatures — this is attribution, not authentication.
-CONFIG_DIR = Path(os.environ.get("SB_HOME", Path.home() / ".config" / "sandbox"))
+# identity
+# who made each save, for humans reading history. no keys, no signatures:
+# attribution, not authentication
+def _sudo_user():
+    # the account that invoked sudo, as (uid, gid, name, home), else None.
+    # under sudo HOME is root's, so the profile would be missed and every
+    # save, pack and export would be filed under root
+    uid = os.environ.get("SUDO_UID")
+    if not uid:
+        return None
+    try:
+        import pwd
+        pw = pwd.getpwuid(int(uid))
+        return (pw.pw_uid, pw.pw_gid, pw.pw_name, Path(pw.pw_dir))
+    except (ImportError, KeyError, ValueError, OSError):
+        name = os.environ.get("SUDO_USER")
+        return (int(uid), -1, name, None) if name else None
+
+def _config_dir():
+    # where the profile lives: SB_HOME, else the invoking account's home,
+    # else this process's home
+    if os.environ.get("SB_HOME"):
+        return Path(os.environ["SB_HOME"])
+    su = _sudo_user()
+    if su and su[3] is not None:
+        return su[3] / ".config" / "sandbox"
+    return Path.home() / ".config" / "sandbox"
+
+CONFIG_DIR = _config_dir()
 CONFIG_FILE = CONFIG_DIR / "profile.json"
 
 def author():
@@ -497,11 +496,13 @@ def author():
             prof = json.loads(CONFIG_FILE.read_text())
         except (OSError, json.JSONDecodeError):
             pass
-    name = os.environ.get("SB_NAME") or prof.get("name") or getpass.getuser()
+    su = _sudo_user()
+    fallback = (su[2] if su and su[2] else None) or getpass.getuser()
+    name = os.environ.get("SB_NAME") or prof.get("name") or fallback
     email = os.environ.get("SB_EMAIL") or prof.get("email") or f"{name}@local"
     return name, email
 
-# ------------------------------------------------------------- ignores ------
+# ignores
 DEFAULT_IGNORES = [SB_DIR, "*.sbox", "*.pyc", "__pycache__", ".DS_Store",
                    ".git", "node_modules"]
 
@@ -524,12 +525,11 @@ def is_ignored(rel: str, pats) -> bool:
             return True
     return False
 
-# --------------------------------------------------------- secret scanner ---
-# What commit-time security can actually deliver: stopping credentials
-# before they enter permanent history. Since 1.3, recognized credentials in
-# clean-UTF-8 text are REDACTED in the committed blob (the working file is
-# never rewritten) and the save proceeds; files that cannot be rewritten
-# safely still block. --allow-secrets saves the bytes verbatim (journaled).
+# secret scanner
+# stop credentials entering permanent history. a recognized one in clean
+# UTF-8 text becomes <REDACTED> in the blob being committed, leaving the
+# file on disk alone. a file that cannot be rewritten faithfully blocks
+# instead. --allow-secrets stores it verbatim
 SECRET_PATTERNS = [
     ("AWS access key",        re.compile(r"\b(AKIA|ASIA)[0-9A-Z]{16}\b")),
     ("private key block",     re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY( BLOCK)?-----")),
@@ -543,7 +543,7 @@ SECRET_PATTERNS = [
 MAX_SCAN_BYTES = 1_000_000
 
 def scan_secrets(data: bytes):
-    """Return [(line_no, label), ...] findings for one file's content."""
+    # Return [(line_no, label), ...] findings for one file's content.
     if len(data) > MAX_SCAN_BYTES or b"\0" in data[:8000]:
         return []                                   # binary or huge: skip
     text = data.decode("utf-8", errors="replace")
@@ -556,11 +556,8 @@ def scan_secrets(data: bytes):
 
 REDACTED = "<REDACTED>"
 
-# The line scanner flags a private key by its BEGIN header, but the key
-# material is the base64 body BELOW that line — redacting only the header
-# would leave the actual secret in history. This whole-block pattern (BEGIN
-# through the matching END, or end-of-file for a truncated block) makes the
-# redaction cover the key itself.
+# the key material is the body below the BEGIN line, so redaction covers
+# the whole block: BEGIN through END, or end of file if truncated
 _KEY_BLOCK = re.compile(
     r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY(?: BLOCK)?-----"
     r".*?"
@@ -568,23 +565,18 @@ _KEY_BLOCK = re.compile(
     r"|\Z)", re.S)
 
 def redact_secrets(data: bytes):
-    """Replace every recognized credential in `data` with <REDACTED>.
-    Returns (new_data, findings, safe):
-      findings  [(line_no, label), ...] — what was found
-      safe      True  -> new_data is a faithful rewrite (or nothing found)
-                False -> secrets were found but the file is not clean UTF-8,
-                         so it cannot be rewritten without corrupting it;
-                         the caller must block instead of redacting.
-    Binary and oversized files are skipped entirely (same rule the scanner
-    has always used). The working file on disk is never touched — this
-    rewrites only the blob that will be committed."""
+    # replace every recognized credential with <REDACTED>.
+    # gives (new_data, findings, safe), where safe is False when something
+    # was found in a file that is not clean UTF-8: it cannot be rewritten
+    # without corrupting it, so the caller must block. binary and oversized
+    # files are skipped, and the file on disk is never touched
     if len(data) > MAX_SCAN_BYTES or b"\0" in data[:8000]:
         return data, [], True                       # binary or huge: skip
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
-        # can't rewrite without mangling bytes — report via the lossy
-        # scanner and let the caller block the save
+        # cannot rewrite without mangling bytes, so report and let the
+        # caller block the save
         return data, scan_secrets(data), False
     findings = []
     def _block_sub(m):
@@ -596,7 +588,7 @@ def redact_secrets(data: bytes):
     for i, line in enumerate(lines):
         for label, pat in SECRET_PATTERNS:
             if label == "private key block":
-                continue                             # handled above, whole-block
+                continue                             # handled above, as a whole block
             line, n = pat.subn(REDACTED, line)
             if n:
                 findings.append((i + 1, label))
@@ -606,19 +598,15 @@ def redact_secrets(data: bytes):
     return "\n".join(lines).encode("utf-8"), findings, True
 
 def _redact_for_commit(repo, disk, paths, allow_secrets=False):
-    """The redaction pass every commit path shares. `disk` is a snapshot
-    whose blobs are already stored; `paths` are the ones about to be
-    committed. Returns (overrides, redacted, hard_blocked):
-      overrides    {rel: (mode, redacted_blob_hash)} to layer over `disk`
-      redacted     [(rel, findings)] for the report
-      hard_blocked [(rel, line, label)] files that hold a credential but
-                   cannot be rewritten faithfully — the caller must stop."""
+    # the redaction pass every commit path shares. gives blob overrides to
+    # layer over disk, what was redacted for the report, and anything the
+    # caller must stop on because it cannot be rewritten faithfully
     over, redacted, hard = {}, [], []
     if allow_secrets:
         return over, redacted, hard
     for rel in paths:
         if rel not in disk:
-            continue                        # a deletion — nothing to scan
+            continue                        # a deletion, nothing to scan
         _, data = repo.get(disk[rel][1])
         new_data, findings, safe = redact_secrets(data)
         if not findings:
@@ -639,31 +627,26 @@ def _report_hard_blocked(hard_blocked, what="save"):
               "--allow-secrets"))
     sys.exit(2)
 
-# ----------------------------------------------------------- trees ----------
+# trees
 _BAD_NAME = re.compile(r"^\.?\.?$")   # "", ".", ".."
 
 def safe_name(name: str) -> bool:
-    """Tree entry names must be single path components. This is what stops a
-    crafted tree object from writing outside the repository on checkout."""
+    # names must be single path components. this is what stops a crafted
+    # tree from writing outside the repository on checkout
     return bool(name) and "/" not in name and "\\" not in name \
         and "\0" not in name and not _BAD_NAME.match(name) and name != SB_DIR
 
 RACY_WINDOW_NS = 2_000_000_000   # files whose mtime OR ctime is < 2s old
-                                 # bypass the stat cache and are re-read
+                                 # bypass the stat cache and get reread
 
-# The stat cache trusts (size, mtime, ctime, inode) to skip re-reading a file.
-# On Windows, Python reports st_ctime as CREATION time, not metadata-change
-# time, so a same-size in-place edit with a restored mtime would not be caught.
-# There the cache is unsafe as an authority, so we disable it and hash every
-# file. 'sb status --deep' and every release/pack path hash unconditionally on
-# all platforms.
+# windows reports st_ctime as creation time, so a same size edit with a
+# restored mtime would slip past the cache. hash everything there instead
 _STATCACHE_TRUSTWORTHY = not sys.platform.startswith("win")
 
 def snapshot_worktree(repo: Repo, write=True, deep=False):
-    """Walk the working tree -> {rel: (mode, blob_hash)}.
-    write=True also stores the blobs. Unless deep=True (or the platform's
-    ctime is untrustworthy), the stat cache lets unchanged files be skipped;
-    recently-touched files are always re-read."""
+    # walk the working tree into {rel: (mode, blob_hash)}. write=True also
+    # stores the blobs. the stat cache skips unchanged files unless deep is
+    # set or the platform's ctime cannot be trusted
     use_cache = _STATCACHE_TRUSTWORTHY and not deep
     pats = load_ignores(repo.root)
     files, cache_updates, symlinks = {}, [], 0
@@ -699,11 +682,11 @@ def snapshot_worktree(repo: Repo, write=True, deep=False):
                                   st.st_ctime_ns, st.st_ino, h))
     repo.remember(cache_updates)
     if symlinks and not write:      # the write pass repeats the walk; stay quiet
-        print(dim(f"note: {symlinks} symlink(s) skipped (not tracked in v1)"))
+        print(dim(f"note: {symlinks} symlink(s) skipped (not tracked)"))
     return files
 
 def build_tree(repo: Repo, files: dict) -> str:
-    """files: {rel: (mode, blob_hash)} -> root tree hash (nested trees)."""
+    # {rel: (mode, blob_hash)} into nested trees, giving the root hash
     def build(prefix):
         entries, subdirs = {}, set()
         plen = len(prefix)
@@ -722,7 +705,7 @@ def build_tree(repo: Repo, files: dict) -> str:
     return build("")
 
 def read_tree(repo: Repo, tree_hash: str, prefix="") -> dict:
-    """Flatten a tree object to {rel: (mode, blob_hash)}. Validates names."""
+    # Flatten a tree object to {rel: (mode, blob_hash)}. Validates names.
     out = {}
     kind, data = repo.get(tree_hash)
     if kind != "tree":
@@ -743,7 +726,7 @@ def read_tree(repo: Repo, tree_hash: str, prefix="") -> dict:
             out[prefix + name] = (mode, h)
     return out
 
-# ----------------------------------------------------------- commits --------
+# commits
 def make_commit(repo: Repo, tree_hash, parents, message) -> str:
     name, email = author()
     c = {"tree": tree_hash, "parents": list(parents), "author": name,
@@ -783,7 +766,7 @@ def head_tree_files(repo):
     return read_tree(repo, c["tree"]), c
 
 def worktree_vs_tree(work, tree):
-    """-> (added, modified, deleted) sorted rel-path lists."""
+    # gives sorted (added, modified, deleted) path lists
     added    = sorted(p for p in work if p not in tree)
     deleted  = sorted(p for p in tree if p not in work)
     modified = sorted(p for p in work if p in tree and work[p] != tree[p])
@@ -792,11 +775,9 @@ def worktree_vs_tree(work, tree):
 _EMPTY_BLOB = hash_obj("blob", b"")
 
 def detect_renames(new_files, old_files, added, deleted):
-    """Exact-content rename detection: pair each deleted path with an added
-    path whose blob content is byte-identical (same hash). Deterministic —
-    both sides are matched in sorted order. Empty files never pair (every
-    empty file would match every other). Returns (renames, added', deleted')
-    with renames as [(old_path, new_path)] and paired paths removed."""
+    # pair each deleted path with an added one holding identical content.
+    # both sides are matched in sorted order, so this is deterministic, and
+    # empty files never pair since they would all match each other
     by_hash = {}
     for p in sorted(deleted):
         h = old_files[p][1]
@@ -812,12 +793,11 @@ def detect_renames(new_files, old_files, added, deleted):
     gone = {o for o, _ in renames}
     return renames, still_added, [p for p in sorted(deleted) if p not in gone]
 
-# ----------------------------------------------------- checkout / cleanup ---
+# checkout / cleanup
 def _safe_parent_fd(root_fd: int, rel: str):
-    """Open the parent directory of `rel` relative to root_fd, refusing to
-    follow any symlinked component. Returns (parent_fd, leaf_name). The
-    caller closes parent_fd. Raises CheckoutConflict if a component that
-    must be a directory is a file, a symlink, or a Windows reparse point."""
+    # open the parent of rel without following any symlinked component.
+    # gives (parent_fd, leaf_name); the caller closes the fd. raises
+    # CheckoutConflict when a component that must be a directory is not
     parts = rel.split("/")
     leaf = parts[-1]
     fd = os.dup(root_fd)
@@ -829,8 +809,8 @@ def _safe_parent_fd(root_fd: int, rel: str):
             except FileNotFoundError:
                 nfd = _mkdir_at(fd, comp)
             except (NotADirectoryError, OSError) as e:
-                # a symlink component raises ELOOP with O_NOFOLLOW; a plain
-                # file raises ENOTDIR — both mean the path is unsafe
+                # ELOOP is a symlink component, ENOTDIR a file in the way.
+                # either way the path is unsafe
                 raise CheckoutConflict(
                     f"cannot check out {rel!r}: {comp!r} is not a real "
                     f"directory (symlink, reparse point, or file in the way)")
@@ -845,14 +825,15 @@ def _mkdir_at(dir_fd: int, name: str) -> int:
     os.mkdir(name, 0o755, dir_fd=dir_fd)
     return os.open(name, os.O_RDONLY | _O_NOFOLLOW | _O_DIRECTORY, dir_fd=dir_fd)
 
-# O_NOFOLLOW / O_DIRECTORY exist on POSIX; fall back to 0 elsewhere and lean
-# on the lstat pre-check below (Windows junctions still need the pre-check).
+# O_NOFOLLOW and O_DIRECTORY are POSIX. elsewhere fall back to 0 and rely
+# on the lstat check below, which windows junctions need anyway
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 
 class CheckoutConflict(Exception):
-    """A path in the working tree conflicts with the target (a symlinked or
-    file-shaped parent, or a directory where a file must go)."""
+    # a path in the worktree blocks the target: a symlink or file where a
+    # parent must be, or a directory where a file must go
+    pass
 
 def _lstat_at(dir_fd, name):
     try:
@@ -861,8 +842,8 @@ def _lstat_at(dir_fd, name):
         return None
 
 def _remove_at(dir_fd, name):
-    """Delete name under dir_fd whether it is a file, symlink, or directory
-    tree — never following a symlink out of the repository."""
+    # delete name under dir_fd, file or symlink or directory tree, without
+    # following a symlink out of the repository
     st = _lstat_at(dir_fd, name)
     if st is None:
         return
@@ -880,14 +861,13 @@ def _remove_at(dir_fd, name):
         os.unlink(name, dir_fd=dir_fd)
 
 def _plan_checkout(target: dict, current: dict):
-    """Two-phase plan. Deletions first (so a file→directory transition frees
-    the name before the directory is created), then creations sorted parent-
-    first (so a directory→file transition removes children before the parent
-    name is reused). Returns (deletions, creations)."""
+    # deletions first, so a file becoming a directory frees the name in
+    # time. then creations, parents before children, so a directory becoming
+    # a file clears its contents before the name is reused
     deletions = [rel for rel in current if rel not in target]
-    # a path that changes shape (file↔dir) shows up as: some old paths under
-    # it disappear and a new path appears; sorting handles ordering, and the
-    # per-name remove/create below tolerates whatever is physically there.
+    # a path changing between file and directory shows up as old paths
+    # leaving and a new one arriving. sorting orders them, and the
+    # remove and create below tolerate whatever is really there
     creations = sorted(
         (rel for rel, mh in target.items()
          if current.get(rel) != mh or True),  # recheck on disk at apply time
@@ -895,30 +875,25 @@ def _plan_checkout(target: dict, current: dict):
     return deletions, creations
 
 def _checkout_preserving(repo, target, current, preserve):
-    """checkout_tree, but never touch paths in `preserve` on disk (they hold
-    someone's in-progress edits — a lock holder's version, or the files an
-    --ignore merge deliberately left alone)."""
+    # checkout_tree, but never touching preserved paths: a lock holder's
+    # version, or files an --ignore merge left alone
     preserve = set(preserve or ())
     t = {k: v for k, v in target.items() if k not in preserve}
     c = {k: v for k, v in current.items() if k not in preserve}
     checkout_tree(repo, t, c, preserve=preserve)
 
 def checkout_tree(repo: Repo, target: dict, current: dict, preserve=None):
-    """Make the worktree equal `target`, symlink-safely and in an order that
-    survives file↔directory transitions. Every write goes through a parent
-    directory opened with no-follow semantics, so a pre-existing symlinked
-    parent can never redirect a write outside the repository. Individual file
-    writes are atomic (exclusive temp + rename + fsync); the whole-tree
-    transition is not a single atomic unit (see the durability notes in the
-    README), but a crash leaves only ordinary unsaved changes, never a write
-    outside the repo and never a torn object in the store. Paths in `preserve`
-    are never written or deleted (used by locks and --ignore merges)."""
+    # make the worktree equal target, in an order that survives files and
+    # directories swapping places. every write goes through a parent opened
+    # without following symlinks, so nothing can be redirected out of the
+    # repository. single writes are atomic; the whole tree is not, but a
+    # crash leaves ordinary unsaved changes, never a torn object
     preserve = preserve or set()
     root_fd = os.open(str(repo.root), os.O_RDONLY | _O_DIRECTORY)
     try:
         deletions, creations = _plan_checkout(target, current)
-        # Phase 0: pre-flight every creation's parent chain for conflicts, so
-        # we fail before mutating anything rather than halfway through.
+        # phase 0: check every parent chain first, so a conflict fails
+        # before anything is touched
         for rel in creations:
             mode, h = target[rel]
             if current.get(rel) == (mode, h):
@@ -939,7 +914,7 @@ def checkout_tree(repo: Repo, target: dict, current: dict, preserve=None):
                 _remove_at(pfd, leaf)
             finally:
                 os.close(pfd)
-        # Phase 2: creations, parent-first.
+        # phase 2: creations, parents first
         for rel in creations:
             if rel in preserve:
                 continue
@@ -963,16 +938,15 @@ def checkout_tree(repo: Repo, target: dict, current: dict, preserve=None):
         os.close(root_fd)
 
 def _write_file_at(parent_fd: int, name: str, data: bytes, perm: int):
-    """Exclusively create a randomized temp file in the verified parent, write
-    and fsync it, then atomically rename it onto `name` and fsync the parent
-    directory. No predictable .sbtmp name, no symlink to follow."""
+    # create a randomized temp file with O_EXCL, write and fsync it, rename
+    # it onto name, fsync the directory. the temp name is unpredictable, so
+    # there is nothing to plant a symlink on
     import stat as _stat
     tmpname = f".sb-{os.urandom(6).hex()}.tmp"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW
     fd = os.open(tmpname, flags, perm, dir_fd=parent_fd)
     try:
-        # os.write may write fewer bytes than asked (POSIX allows partial
-        # writes); loop until every byte has landed
+        # os.write may write fewer bytes than asked; loop until all land
         view = memoryview(data)
         off = 0
         while off < len(view):
@@ -995,8 +969,8 @@ def _write_file_at(parent_fd: int, name: str, data: bytes, perm: int):
         pass
 
 def _prune_empty_dirs(repo: Repo):
-    """Remove directories emptied by deletions. Never descends through or
-    removes .sb, and never follows symlinks."""
+    # remove directories left empty. never enters or removes .sb, and never
+    # follows symlinks
     sbdir = repo.vdir.resolve()
     root = repo.root.resolve()
     for dirpath, dirnames, filenames in os.walk(repo.root, topdown=False,
@@ -1009,62 +983,43 @@ def _prune_empty_dirs(repo: Repo):
         except OSError:
             pass
 
-# --------------------------------------------------------- shared locking ---
-# Everyone works in ONE repository — one folder, one database — without
-# clone/push/pull. Coordination is by per-file locks, and since 1.4 a lock
-# is about CONTENT, not permission:
+# shared locking
+# a team shares one folder and one database. a lock protects content, not
+# permission:
 #
-#   * Editing a file auto-locks it to you (detected the next time any sb
-#     command scans the tree — sb has no daemon, so acquisition, enforcement
-#     and expiry are evaluated lazily but deterministically).
-#   * While you hold a lock, YOUR bytes are the file. Anyone may open and
-#     edit it, but on the next sb command their version is put back to
-#     yours, on disk. Their rejected bytes are kept in the object store and
-#     named in the journal ('sb salvage <hash>' writes them out again), so
-#     the revert costs nothing permanently — it just refuses to let a second
-#     writer's copy become the version of record.
-#   * Only you can save that file. Everyone else's save skips it entirely,
-#     so a locked file can never be committed by anyone but its holder.
-#   * Your own later edits move the lock forward: each command that sees you
-#     changed the file again records the new content as the protected one and
-#     restarts the expiry clock.
-#   * A lock ends when you 'sb save' it, when you put the file back the way
-#     it was saved (nothing left to protect), or after an hour of inactivity.
-#     On expiry your edits are auto-saved (never lost), then auto-reverted —
-#     in history and on disk — so the shared tree returns to its pre-edit
-#     state. Bring them back with 'sb restore <auto-save hash>'.
+#   * editing a file locks it to you
+#   * your bytes are then the file. others can edit it, but their version is
+#     put back on the next command, and their bytes are stored and named in
+#     the journal for 'sb salvage <hash>'
+#   * only you can save it. everyone else's save skips it
+#   * editing it again moves the lock forward and resets the clock
+#   * it ends when you save, when the file matches its saved state, or after
+#     LOCK_TTL idle, which auto saves the edits and then reverts them
 #
-# Shared operation is ALWAYS ON since 1.3 — there is no single-user mode
-# and no way to turn locking off. A repo used by one person simply never
-# sees a foreign lock; the semantics collapse to the old solo behavior.
+# there is no daemon, so locks are claimed, enforced and expired at the
+# start of every command that touches state.
 #
-# Attribution: a file on disk carries no note of who edited it, so a lock
-# claimed at scan time must not simply go to whoever ran the scan (Alice
-# edits, Bob runs 'sb status', Bob must NOT become the lock owner). The one
-# signal a shared drive does provide is the file's owner uid: each teammate
-# writes as their own OS account. So sb keeps a uid -> identity registry
-# (updated whenever anyone runs a command) and locks each found edit to
-# the account that owns the file. Where the signal doesn't exist —
-# deletions, Windows, uid-squashing network mounts, or one login shared by
-# several sb identities — it falls back to the invoking user.
+# a file on disk says nothing about who edited it, so a lock must not go to
+# whoever ran the scan. the signal is the file's owner uid, read through the
+# uid registry. with no signal (deletions, windows, squashing mounts, one
+# login for several identities) it falls back to the invoking user.
 LOCK_TTL = int(os.environ.get("SB_LOCK_TTL", "3600"))   # one hour, seconds
-LOCK_DELETED = "deleted"    # held-content marker: the holder removed the file
+LOCK_DELETED = "deleted"    # held marker: the holder deleted it
 
 def shared_mode(repo):
-    # 1.3: shared operation is structural, not a setting. Kept as a function
-    # so call sites read naturally; it can never return False. The legacy
-    # meta key 'shared' is ignored (old journals still display its entries).
+    # locking is structural, not a setting, so this cannot return False.
+    # old journals may still hold 'shared' entries; they are only displayed
     return True
 
 def _my_uid():
     try:
         return os.getuid()
-    except AttributeError:          # Windows — no usable file-owner signal
+    except AttributeError:          # windows has no usable owner signal
         return None
 
 def register_identity(repo):
-    """Remember which OS account maps to which sb identity so edits found
-    on disk can be attributed to the person who actually wrote them."""
+    # remember which OS account maps to which identity, so edits found on
+    # disk can be attributed to whoever wrote them
     uid = _my_uid()
     if uid is None:
         return
@@ -1077,8 +1032,8 @@ def register_identity(repo):
                                       "email": email})
 
 def _uid_identity(repo, uid):
-    """Best-known (name, email) for an OS account: the registry if that
-    person has ever run sb here, else their system account name."""
+    # best known (name, email) for an OS account: the registry if they have
+    # run sb here, else their system account name
     v = repo.meta(f"uid:{uid}")
     if v:
         try:
@@ -1094,10 +1049,8 @@ def _uid_identity(repo, uid):
     return name, f"{name}@uid{uid}"
 
 def _restore_paths_on_disk(repo, targets):
-    """Write {rel: (mode, hash) or None} onto the worktree. None removes the
-    path. Every write goes through the same no-follow, descriptor-relative,
-    atomic machinery checkout uses, so a symlink planted at the path or in a
-    parent cannot redirect the write outside the repository."""
+    # write {rel: (mode, hash) or None} onto the worktree, None meaning
+    # remove. same symlink safe writes as checkout
     root_fd = os.open(str(repo.root), os.O_RDONLY | _O_DIRECTORY)
     try:
         for rel, mh in sorted(targets.items()):
@@ -1115,12 +1068,10 @@ def _restore_paths_on_disk(repo, targets):
     _prune_empty_dirs(repo)
 
 def _only_redaction_differs(repo, tree_files, work, p):
-    """True when the on-disk file differs from the last save ONLY because
-    the save holds the redacted form of its secrets. Such a file is not
-    abandoned work — committing it verbatim on lock expiry would leak the
-    secret into history, and reverting it would destroy the user's live
-    credential on disk. Expiry leaves these files alone, and a lock on one
-    is released rather than enforced forever."""
+    # true when the file differs from the last save only because the save
+    # holds its secrets redacted. that is not abandoned work: committing it
+    # would leak the credential and reverting it would delete the live one,
+    # so expiry skips the file and releases its lock
     if p not in work or p not in tree_files:
         return False
     try:
@@ -1132,15 +1083,13 @@ def _only_redaction_differs(repo, tree_files, work, p):
             and hash_obj("blob", data2) == tree_files[p][1])
 
 def foreign_locks(repo):
-    """Paths locked by someone other than me. These hold another person's
-    in-progress work: they are never overwritten by a checkout, never count
-    as my unsaved changes, and are never included in my saves."""
+    # paths locked by someone else. never overwritten by a checkout, never
+    # counted as my unsaved changes, never included in my saves
     _, email = author()
     return {p for p, l in repo.locks().items() if l["email"] != email}
 
 def _disk_state(repo, rel):
-    """(mode, hash, data, st) for a path, or (None, None, b'', st/None).
-    Anything that is not a plain file reads as absent."""
+    # (mode, hash, data, st) for a path. anything but a plain file is absent
     p = repo.root / rel
     try:
         st = os.lstat(p)
@@ -1157,14 +1106,9 @@ def _disk_state(repo, rel):
     return mode, hash_obj("blob", data), data, st
 
 def _lock_actor(repo, lock, st):
-    """Which sb identity most likely made an on-disk change to a locked file.
-
-    The file's owner uid is the only hard signal a shared folder gives, so
-    it wins when it is usable: a file now owned by a different account was
-    written by that account. When the uid cannot separate the two people —
-    the same login used by several sb identities, a uid-squashing mount, a
-    deletion with nothing left to stat, or Windows — the best remaining
-    signal is who is running sb right now."""
+    # who most likely changed a locked file. the owner uid wins when it can
+    # tell the two people apart, since a file owned by another account was
+    # written by it. otherwise fall back to whoever is running sb
     _, me_email = author()
     uid = getattr(st, "st_uid", None) if st is not None else None
     if uid is not None and lock.get("uid", -1) >= 0:
@@ -1176,20 +1120,12 @@ def _lock_actor(repo, lock, st):
     return me_email
 
 def enforce_locks(repo, quiet=False):
-    """Keep every locked file equal to its holder's version.
-
-    For each lock the on-disk content is compared with the content the
-    holder is protecting:
-      * unchanged            -> nothing to do
-      * changed by the holder -> the protected content moves forward, and
-                                 the expiry clock restarts
-      * changed by anyone else -> the file is put back on disk to the
-                                 holder's version; the rejected bytes are
-                                 stored and journaled first, so they can be
-                                 recovered with 'sb salvage <hash>'
-    A lock whose protected content matches the last save is released: there
-    is nothing in progress left to protect. Returns True if anything on
-    disk was changed."""
+    # keep every locked file equal to its holder's version. against the
+    # content the lock protects, what is on disk is either unchanged, the
+    # holder's own new edit (protect that instead, reset the clock), or
+    # someone else's (store and journal it, then put the holder's back).
+    # a lock matching the last save is released, having nothing left to
+    # protect. gives True when anything on disk changed
     locks = repo.locks()
     if not locks:
         return False
@@ -1200,8 +1136,7 @@ def enforce_locks(repo, quiet=False):
         mode, cur_h, data, st = _disk_state(repo, rel)
         cur = (mode, cur_h) if cur_h is not None else None
         if not l["held"]:
-            # a pre-1.4 lock, recorded before content was tracked: adopt
-            # what is there now instead of guessing at a version
+            # a lock older than content tracking: adopt what is on disk
             repo.update_lock_held(rel, cur_h or LOCK_DELETED,
                                   mode or "100644", touch=False)
             held = cur
@@ -1230,7 +1165,7 @@ def enforce_locks(repo, quiet=False):
                 "paths": sorted(restore),
                 "kept": {rel: h for rel, h, _ in rejected},
                 "by": author()[1]})
-        # always reported, never quiet: someone's bytes just left the disk
+        # always reported: someone's bytes just left the disk
         print(yellow("reverted ") + dim(f"{len(restore)} file(s) to their "
               "lock holder's version — a locked file is theirs until they "
               "save"))
@@ -1251,33 +1186,25 @@ def enforce_locks(repo, quiet=False):
     return bool(restore)
 
 def process_lock_expiry(repo):
-    """Handle expired locks. For each owner's abandoned edits:
-      1. auto-save them as a commit in the owner's name — nothing is lost;
-      2. auto-revert those paths, in history AND on disk, to their pre-edit
-         state, so the shared tree goes back to the way the owner found it.
-    The edits stay one command away: 'sb restore <auto-save hash>' (the hash
-    is printed and is in 'sb log'/'sb journal'). Runs at the start of every
-    state-touching command so an abandoned lock never blocks the team.
-    Returns True if anything was committed.
-
-    The auto-save is a PRESERVATION commit, so it saves the bytes verbatim:
-    redacting here and then reverting the disk would destroy the only copy
-    of a live credential. If the snapshot contains recognizable secrets sb
-    says so loudly and flags it in the journal; files whose only difference
-    from the last save is a redacted secret are skipped entirely."""
+    # for each owner's abandoned edits: auto save them in that owner's name,
+    # then revert those paths in history and on disk. the hash is printed and
+    # journaled, so 'sb restore <hash>' brings the work back.
+    #
+    # the auto save keeps bytes verbatim: redacting and then reverting the
+    # disk would destroy the only copy of a live credential. secrets are
+    # reported and flagged, and a file differing only by an already redacted
+    # secret is skipped
     register_identity(repo)
     now = int(time.time())
     expired = [(p, l) for p, l in repo.locks().items()
                if now - l["since"] >= LOCK_TTL]
     if not expired:
         return False
-    # write=True: the auto-save commits these exact stored blobs, never a
-    # later re-read of the worktree
+    # write=True: commit these exact blobs, not a later reread
     work = snapshot_worktree(repo, write=True)
     tree_files, head_c = head_tree_files(repo)
     committed = False
-    # group expired locks by owner so each person's abandoned edits land as
-    # one save + one revert attributed to them
+    # group by owner: one save + one revert each, attributed to them
     by_owner = {}
     for p, l in expired:
         by_owner.setdefault((l["owner"], l["email"]), []).append(p)
@@ -1287,7 +1214,7 @@ def process_lock_expiry(repo):
                    and not _only_redaction_differs(repo, tree_files, work, p)]
         if not changed:
             continue
-        prior = {p: tree_files.get(p) for p in changed}   # pre-edit state
+        prior = {p: tree_files.get(p) for p in changed}   # the state before those edits
         secretish = sorted(p for p in changed if p in work
                            and scan_secrets(repo.get(work[p][1])[1]))
         extra = {"secrets_present": secretish} if secretish else None
@@ -1296,15 +1223,15 @@ def process_lock_expiry(repo):
                             owner=owner, email=email, op="autosave",
                             extra=extra)
         tree_files, head_c = head_tree_files(repo)  # refresh after commit
-        # the revert commit: the same paths, back to their pre-edit content
-        # (a path that didn't exist before is deleted again)
+        # back to the content before the edits. a path that did not exist
+        # before is deleted again
         revert_work = {p: mh for p, mh in prior.items() if mh is not None}
         _commit_subset(repo, revert_work, tree_files, head_c, changed,
                        f"auto-revert: {owner}'s expired edits "
                        f"(bring them back: sb restore {short(h1)})",
                        owner=owner, email=email, op="autosave")
         tree_files, head_c = head_tree_files(repo)
-        # and put the pre-edit content back on disk, symlink-safely
+        # and put that content back on disk
         _restore_paths_on_disk(repo, prior)
         committed = True
         print(dim(f"auto-saved {owner}'s expired edits as ")
@@ -1320,24 +1247,15 @@ def process_lock_expiry(repo):
     return committed
 
 def acquire_locks_for_edits(repo, quiet=False):
-    """Lock every modified file that isn't already locked — each to the
-    person who actually edited it, recording the exact content that person
-    is protecting. This is the 'editing auto-locks' rule, applied lazily by
-    whichever sb invocation scans the tree next.
-
-    The snapshot is taken with write=True on purpose: a lock has to be able
-    to put its holder's version back, so those bytes must be in the store
-    before anyone else can overwrite the file.
-
-    Attribution goes by the file's owner uid, not the invoking user: if Bob
-    runs 'sb status' and finds Alice's unsaved edit, the lock is created in
-    Alice's name (from the uid registry, or her system account name if she
-    has never run sb here). Deletions leave nothing to stat, and Windows has
-    no owner uid — those fall back to the invoker.
-
-    A file already locked by someone else differs from the last commit
-    because their protected version sits on disk. That is THEIR work, not
-    mine — I neither lock it nor am blocked by it."""
+    # lock every modified file that is not locked yet, each to the person
+    # who edited it, recording the content they are protecting.
+    #
+    # write=True is deliberate: a lock has to be able to put its holder's
+    # version back, so those bytes must be stored before anyone overwrites
+    # the file.
+    #
+    # attribution goes by the file's owner uid, so Bob running 'sb status'
+    # over Alice's edit creates the lock in her name
     register_identity(repo)
     name, email = author()
     me_uid = _my_uid()
@@ -1346,7 +1264,7 @@ def acquire_locks_for_edits(repo, quiet=False):
     a, m, d = worktree_vs_tree(work, tree_files)
     edited = set(a) | set(m) | set(d)
     locks = repo.locks()
-    # unlocked edits, grouped by who owns the file on disk
+    # unlocked edits, grouped by the file's owner on disk
     mine_new, theirs = [], {}
     for p in edited:
         if p in locks:
@@ -1384,10 +1302,8 @@ def acquire_locks_for_edits(repo, quiet=False):
                             for p in sorted(paths)])
 
 def sync_locks(repo, quiet=False):
-    """The whole lock lifecycle, in the only order that keeps content
-    honest: put every locked file back to its holder's version, retire
-    abandoned locks, then claim whatever is newly edited. Every command
-    that reads or writes repository state runs this first."""
+    # the whole lifecycle, in the only order that keeps content honest:
+    # enforce, expire, then claim. every command touching state runs it
     enforce_locks(repo, quiet=quiet)
     process_lock_expiry(repo)
     acquire_locks_for_edits(repo, quiet=quiet)
@@ -1401,24 +1317,17 @@ def _ago(ts):
 def _commit_subset(repo, work, tree_files, head_c, subset, message,
                    *, owner=None, email=None, op="save", extra=None,
                    verify_drift=False, disk_ref=None):
-    """Commit a NEW tree that equals the last committed tree with only
-    `subset` paths replaced by their `work` version. This is how 'save my
-    changes' leaves everyone else's in-progress edits untouched in the
-    commit. Returns the new commit hash.
-
-    The tree is built from the blob hashes ALREADY IN `work` — the snapshot
-    (or candidate) the caller scanned and gated — never from a fresh re-read
-    of the worktree. What passed the gates is byte-for-byte what lands in
-    history. Every referenced blob must already be in the store (snapshot
-    with write=True, or repo.put by the caller); a missing one is corruption
-    and raises rather than being papered over with a disk read.
-
-    verify_drift=True re-checks, inside the commit transaction, that the
-    files on disk still match `disk_ref` (default: `work`) and refuses if
-    the worktree moved while the caller was scanning and testing — the same
-    guard the whole-tree save path applies. Pass disk_ref=<original disk
-    snapshot> when `work` holds rewritten (e.g. redacted) blobs that are
-    intentionally different from the disk."""
+    # commit a tree equal to the last one with only subset replaced by its
+    # work version. this is how my save leaves everyone else's edits alone.
+    #
+    # the tree is built from blob hashes already in work, what the caller
+    # scanned and gated, never from a fresh read, so what passed the gates
+    # is what lands in history. a referenced blob missing from the store is
+    # corruption and raises.
+    #
+    # verify_drift rechecks inside the transaction that disk still matches
+    # disk_ref and refuses if the worktree moved while gates ran. pass the
+    # original snapshot as disk_ref when work holds redacted blobs
     merged = dict(tree_files)
     for rel in subset:
         if rel in work:
@@ -1458,10 +1367,9 @@ def _commit_subset(repo, work, tree_files, head_c, subset, message,
     return h
 
 def ensure_clean(repo, extra_exempt=None):
-    """Refuse to run when the working tree holds changes an operation would
-    throw away. Files locked by other people are exempt: their in-progress
-    edits are supposed to be sitting there, every checkout preserves them,
-    and no operation of mine can commit or destroy them."""
+    # refuse to run when the worktree holds changes this would throw away.
+    # other people's locked files are exempt, since every checkout preserves
+    # them and nothing I do can commit them
     exempt = foreign_locks(repo) | set(extra_exempt or ())
     work = snapshot_worktree(repo, write=False)
     tree, _ = head_tree_files(repo)
@@ -1473,10 +1381,9 @@ def ensure_clean(repo, extra_exempt=None):
             "       (" + ", ".join(dirty[:5])
             + (" …" if len(dirty) > 5 else "") + ")")
 
-# ------------------------------------------------------- three-way merge ----
+# three way merge
 def _diff_regions(base, side):
-    """Changed regions of `side` relative to `base`:
-    [(base_start, base_end, replacement_lines), ...] in base coordinates."""
+    # changed regions of side against base, in base coordinates
     out = []
     for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(
             None, base, side, autojunk=False).get_opcodes():
@@ -1494,11 +1401,10 @@ def _apply_regions(base, s, e, regions):
     return out
 
 def merge3(base, ours, theirs):
-    """Line-level three-way merge. -> (merged_lines, n_conflicts).
-    Non-overlapping changes merge cleanly; overlapping changes become
-    conflict-marked blocks. Deliberately conservative: touching hunks and
-    same-point insertions are treated as conflicts (a false conflict is
-    safe; a false merge is not)."""
+    # line level three way merge, giving (merged_lines, n_conflicts).
+    # separate changes merge, overlapping ones become conflict blocks.
+    # touching hunks and insertions at one point count as conflicts: a false
+    # conflict is safe, a false merge is not
     ca, cb = _diff_regions(base, ours), _diff_regions(base, theirs)
     out, conflicts = [], 0
     ia = ib = pos = 0
@@ -1539,13 +1445,10 @@ def merge3(base, ours, theirs):
     return out, conflicts
 
 def _mergeable_lines(repo, h):
-    """Blob -> list of lines suitable for a byte-preserving line merge, or
-    None if the file must not be auto-merged. A file is mergeable only when
-    it is valid UTF-8, contains no NUL, uses LF endings exclusively (no CR),
-    and ends in a newline — the exact shape that '\\n'.join(...) + '\\n'
-    reconstructs without altering a single byte. CRLF files, files with no
-    trailing newline, mixed endings, invalid UTF-8, and binaries all return
-    None and are reported as conflicts rather than silently rewritten."""
+    # lines that can be merged without changing bytes, or None if the file
+    # must not be merged at all. that means valid UTF-8, no NUL, LF endings
+    # only and a trailing newline, the shape join rebuilds exactly.
+    # everything else is reported as a conflict rather than rewritten
     if h is None:
         return []
     data = repo.get(h)[1]
@@ -1562,22 +1465,17 @@ def _mergeable_lines(repo, h):
     lines = text.split("\n")
     if lines and lines[-1] == "":
         lines.pop()                     # the trailing newline, not a line
-    # round-trip guard: prove reconstruction is byte-identical before we
-    # ever rely on it, so no encoding edge case can slip through
+    # prove the rebuild is identical before relying on it
     if ("\n".join(lines) + "\n").encode("utf-8") != data:
         return None
     return lines
 
-# ---------------------------------------------------------- test gates ------
-# Versioned test scripts live in sb-tests/<stage>/ so they travel with
-# branches and are themselves history. Stages:
-#   pre-save    gates every save          (sb save)
-#   pre-merge   gates merges, incl. FFs   (sb merge)
-#   pre-publish  gates deployments         (sb deploy)
-# Scripts run sorted (name them 10-lint.sh, 20-unit.py, ...) inside a
-# PRISTINE temp checkout of the exact candidate tree — never your dirty
-# worktree — with SB_STAGE / SB_BRANCH / SB_COMMIT / SB_REPO exported.
-# Non-zero exit or timeout blocks the operation; --no-verify overrides.
+# test gates
+# scripts in sb-tests/<stage>/ are tracked files, so they travel with
+# branches. the stages gate saves, merges and releases.
+# they run in name order inside a clean temp checkout of the candidate tree,
+# never the worktree, with SB_STAGE, SB_BRANCH, SB_COMMIT and SB_REPO set.
+# a bad exit or a timeout blocks the operation; --no-verify overrides
 TESTS_DIR = "sb-tests"
 STAGES = ("pre-save", "pre-merge", "pre-publish")
 TEST_TIMEOUT = int(os.environ.get("SB_TEST_TIMEOUT", "120"))
@@ -1606,12 +1504,11 @@ def discover_tests(root: Path, stage: str):
 
 def run_stage(repo: Repo, stage: str, files: dict, *,
               from_worktree=False, commit="(worktree)", quiet_if_empty=True):
-    """Run one gate against the candidate tree. True = gate passes."""
+    # Run one gate against the candidate tree. True = gate passes.
     with tempfile.TemporaryDirectory(prefix="sb-test-") as tmp:
         tmpdir = Path(tmp)
         _materialize(repo, files, tmpdir, from_worktree)
-        # discover from the CANDIDATE tree so merges run the merged
-        # result's own tests, not the current worktree's
+        # discover from the candidate tree, so a merge runs its own tests
         scripts = discover_tests(tmpdir, stage)
         if not scripts:
             if not quiet_if_empty:
@@ -1649,30 +1546,30 @@ def run_stage(repo: Repo, stage: str, files: dict, *,
         return True
 
 TEST_TEMPLATE_SH = """#!/bin/sh
-# {name} — {stage} gate for sandbox (sb)
-# Runs inside a clean checkout of the candidate tree (cwd = checkout root).
-# Env: SB_STAGE, SB_BRANCH, SB_COMMIT, SB_REPO.  Exit 0 = pass, non-zero = block.
+# {name}: {stage} gate for sandbox (sb)
+# runs inside a clean checkout of the candidate tree (cwd = checkout root)
+# env: SB_STAGE, SB_BRANCH, SB_COMMIT, SB_REPO.  exit 0 passes
 set -eu
 
 echo "[{name}] checking $SB_BRANCH @ $SB_COMMIT"
-# --- your checks here, e.g.: ---
+# your checks here, for example:
 # python3 -m py_compile $(find . -name '*.py' -not -path './sb-tests/*')
 # ./run_unit_tests.sh
 exit 0
 """
 
 TEST_TEMPLATE_PY = """#!/usr/bin/env python3
-# {name} — {stage} gate for sandbox (sb).
-# Runs inside a clean checkout of the candidate tree (cwd = checkout root).
-# Env: SB_STAGE, SB_BRANCH, SB_COMMIT, SB_REPO. Exit 0 = pass.
+# {name}: {stage} gate for sandbox (sb)
+# runs inside a clean checkout of the candidate tree (cwd = checkout root)
+# env: SB_STAGE, SB_BRANCH, SB_COMMIT, SB_REPO. exit 0 passes
 import os, sys
 
 print("[{name}] checking", os.environ["SB_BRANCH"], "@", os.environ["SB_COMMIT"])
-# --- your checks here ---
+# your checks here
 sys.exit(0)
 """
 
-# ------------------------------------------------------------ commands ------
+# commands
 def cmd_init(args):
     root = Path(".").resolve()
     if (root / SB_DIR).exists():
@@ -1733,15 +1630,10 @@ def cmd_save(args):
     if not getattr(args, "global_force", False):
         _save_shared(repo, args)           # the normal path: your files only
         return
-    # --global-force: snapshot the ENTIRE worktree, everyone's edits included.
-    # Read the worktree ONCE, storing every candidate blob as we go. From this
-    # point on, the redaction pass, the secret scan, the test gate, and the
-    # commit all operate on this exact stored tree — never on fresh re-reads
-    # of the worktree — so what passes the gates is byte-for-byte what gets
-    # committed. If the live worktree changes underneath us during testing,
-    # we notice and report it rather than committing something that was never
-    # scanned or tested. Everything runs inside one transaction so an abort
-    # also rolls the candidate blobs (redacted or not) back out of the store.
+    # --global-force: snapshot the whole worktree, everyone's edits with it.
+    # the worktree is read once into stored blobs, and redaction, gates and
+    # the commit all work from those, so what passed the gates is what gets
+    # committed. one transaction, so an abort rolls the blobs back out
     with repo.transaction():
         disk = snapshot_worktree(repo, write=True)   # what's really on disk
         tree_files, head_c = head_tree_files(repo)
@@ -1749,32 +1641,28 @@ def cmd_save(args):
         if not (added or modified or deleted) and head_c:
             print(green("nothing changed — no save created"))
             return
-        # redaction pass: recognized credentials in new/changed files are
-        # replaced with <REDACTED> in the blob that will be committed. The
-        # file on disk is never rewritten. Files that contain secrets but
-        # can't be rewritten faithfully (not clean UTF-8) still block.
+        # credentials become <REDACTED> in the blob being committed, leaving
+        # the file on disk alone
         over, redacted, hard_blocked = _redact_for_commit(
             repo, disk, added + modified, args.allow_secrets)
         if hard_blocked:
             _report_hard_blocked(hard_blocked)
         work = dict(disk)                  # the candidate tree to commit
         work.update(over)
-        # redaction can make a "change" identical to what's already saved;
-        # re-check so we don't create an empty save
+        # redaction can leave a change identical to what is already saved,
+        # so recheck rather than create an empty save
         a2, m2, d2 = worktree_vs_tree(work, tree_files)
         if not (a2 or m2 or d2) and head_c:
             print(green("nothing new to save — the only changes were "
                         "redacted secrets already saved as <REDACTED>"))
             return
-        # gate: materialize the stored candidate tree (from_worktree=False) so
-        # the tests run exactly the bytes that will be committed
+        # tests run the stored tree, so they see the bytes being committed
         if not args.no_verify:
             if not run_stage(repo, "pre-save", work, from_worktree=False):
                 die("pre-save tests failed — save blocked "
                     "(--no-verify to override)")
-        # guard: if the worktree drifted from the snapshot while we scanned
-        # and tested, refuse rather than commit an untested state (compared
-        # against `disk`, since redaction makes `work` differ by design)
+        # refuse if the worktree moved while gates ran. compared against
+        # disk, since redaction makes work differ on purpose
         recheck = snapshot_worktree(repo, write=False)
         if recheck != disk:
             drifted = sorted(set(disk) ^ set(recheck)) or \
@@ -1794,7 +1682,7 @@ def cmd_save(args):
         repo.update_ref(repo.current_branch(), h, op="save",
                         expect=head_c["hash"] if head_c else None,
                         extra=bypass)
-        # --global-force sweeps in everyone's edits, so all locks are resolved
+        # everyone's edits are in the commit, so no lock is left to protect
         repo.clear_locks(list(repo.locks().keys()))
     n = len(added) + len(modified) + len(deleted)
     print(f"{bold('saved')} {amber(short(h))} "
@@ -1813,28 +1701,21 @@ def _report_redactions(redacted):
              "an ignored file (sb ignore <pattern>) so this stops recurring"))
 
 def _save_shared(repo, args):
-    """The normal save: commit only the current user's own edits (the files
-    they hold locks on / have changed), leaving everyone else's in-progress
-    work untouched in the commit. Releases the user's locks.
-
-    A file locked by somebody else is never included, whatever is on disk —
-    their lock means their version is the file, and only they can commit it.
-
-    Consistency contract (same as the --global-force whole-tree path): the
-    worktree is read ONCE into stored blobs; redaction, the secret check,
-    the test gate, and the commit all operate on those exact blobs; and the
-    commit re-checks the disk against the original snapshot so a worktree
-    that drifted during testing aborts the save instead of smuggling
-    unscanned, untested bytes into history."""
+    # the normal save: commit only this user's edits, leave everyone else's
+    # alone in the commit, release this user's locks. a file locked by
+    # someone else is never included, whatever is on disk.
+    #
+    # same contract as the --global-force path: read the worktree once into
+    # stored blobs, run redaction and gates and the commit from those, and
+    # recheck disk before committing so drift aborts the save
     name, email = author()
     with repo.transaction():
-        # one transaction end to end: an abort at any point also rolls the
-        # candidate blobs (redacted or not) back out of the object store
+        # one transaction, so an abort rolls the blobs back out
         disk = snapshot_worktree(repo, write=True)   # what's really on disk
         tree_files, head_c = head_tree_files(repo)
         locks = repo.locks()
         mine = sorted(p for p, l in locks.items() if l["email"] == email)
-        # also include files I changed that somehow aren't locked (defensive)
+        # include files I changed that somehow aren't locked
         a, m, d = worktree_vs_tree(disk, tree_files)
         mine = sorted(set(mine) | {p for p in (set(a) | set(m) | set(d))
                                    if locks.get(p, {}).get("email", email) == email})
@@ -1847,19 +1728,16 @@ def _save_shared(repo, args):
                          "locks: " + ", ".join(held[:4])
                          + (" …" if len(held) > 4 else "")))
             return
-        # redaction pass: recognized credentials are replaced with <REDACTED>
-        # in the blob that will be committed; the file on disk is never
-        # rewritten. Files with secrets that can't be rewritten faithfully
-        # (not clean UTF-8) still block the save.
+        # credentials become <REDACTED> in the blob being committed, leaving
+        # the file on disk alone
         over, redacted, hard_blocked = _redact_for_commit(
             repo, disk, changed, args.allow_secrets)
         if hard_blocked:
             _report_hard_blocked(hard_blocked)
         work = dict(disk)                  # the candidate content to commit
         work.update(over)
-        # redaction can make a "change" identical to what's already saved
-        # (the file's only difference was a secret already stored as
-        # <REDACTED>); re-filter so we don't create an empty save
+        # redaction can leave a change identical to what is already saved,
+        # so refilter rather than create an empty save
         changed = [p for p in changed if work.get(p) != tree_files.get(p)]
         if not changed:
             print(green("nothing new to save — the only changes were "
@@ -1881,10 +1759,8 @@ def _save_shared(repo, args):
         if args.allow_secrets: bypass["skipped_secret_scan"] = True
         if redacted:
             bypass["secrets_redacted"] = sorted(rel for rel, _ in redacted)
-        # verify_drift + disk_ref=disk: the commit is refused if any of these
-        # files changed on disk after the snapshot (the gate/scan window).
-        # disk_ref is the ORIGINAL snapshot because `work` may hold redacted
-        # blobs that legitimately differ from the disk.
+        # refuse if any of these changed on disk after the snapshot.
+        # disk_ref is that snapshot, since work may hold redacted blobs
         h = _commit_subset(repo, work, tree_files, head_c, changed,
                            args.message, owner=name, email=email, op="save",
                            extra=bypass or None,
@@ -1912,8 +1788,7 @@ def cmd_log(args):
         print(f"{amber(short(c['hash']))}  {dim(when)}  {c['author']} "
               f"{dim('<' + c['email'] + '>')}{merge}")
         rows = c["message"].splitlines() or ['""']
-        # what this save changed, relative to its first parent — so the log
-        # shows every action's effect, not just its message
+        # what this save changed, relative to its first parent
         try:
             ptree = (read_tree(repo, parse_commit(repo, c["parents"][0])["tree"])
                      if c["parents"] else {})
@@ -1978,14 +1853,13 @@ def cmd_diff(args):
                 print(line)
 
 def cmd_undo(args):
-    """Non-destructive undo. Plain: a NEW save whose content equals the
-    previous save (history is never rewritten; run undo again to redo).
-    With -p <path>: bring just that file or folder back from the last
-    save, overwriting the working copy — no new save is created."""
+    # undo without destroying anything: a new save whose content equals the
+    # previous one, so undo again redoes. with -p, bring back one path from
+    # the last save instead, overwriting the working copy and saving nothing
     repo = need_repo()
     sync_locks(repo, quiet=True)
     keep = foreign_locks(repo)
-    if args.path:                       # targeted: un-mangle one path
+    if args.path:                       # targeted: one path only
         tree, _ = head_tree_files(repo)
         rel = args.path.rstrip("/")
         matches = [rel] if rel in tree else \
@@ -1998,9 +1872,8 @@ def cmd_undo(args):
                 + ", ".join(blocked[:4]) + (" …" if len(blocked) > 4 else "")
                 + "\n       their version is the file until they save it "
                   "(see 'sb locks')")
-        # write through the same no-follow, descriptor-relative path that
-        # checkout uses — a symlinked parent or a symlink squatting on the
-        # target name must never redirect the restore outside the repo
+        # same symlink safe write checkout uses, so nothing at the target or
+        # above it can redirect this
         root_fd = os.open(str(repo.root), os.O_RDONLY | _O_DIRECTORY)
         try:
             for m in matches:
@@ -2041,8 +1914,7 @@ def cmd_undo(args):
          + dim("(history preserved; sb undo again to redo)"))
 
 def _journal_tips_at(repo, seq):
-    """Replay the journal up to entry `seq` and return the branch tips
-    as recorded at that point: {branch: commit_hash}."""
+    # replay the journal to entry seq, giving the tips as recorded then
     tips = {}
     for e in repo.journal_entries():
         if e["seq"] > seq:
@@ -2055,9 +1927,8 @@ def _journal_tips_at(repo, seq):
     return tips
 
 def _resolve_restore(repo, what):
-    """Resolve a restore target — journal anchor, save-hash prefix, release
-    label, or branch — to (commit_hash, how). Anchors resolve to the
-    CURRENT branch's tip as of that journal moment."""
+    # resolve an anchor, hash prefix, release label or branch to a commit.
+    # an anchor gives the current branch's tip as of that journal entry
     hits = []
     recs = [e for e in repo.journal_entries()
             if e["op"] in ("publish", "deploy")
@@ -2077,7 +1948,7 @@ def _resolve_restore(repo, what):
             die(f"'{what}' matches {len(rows)} saves — give more characters")
         if len(rows) == 1:
             hits.append((rows[0][0], "save " + short(rows[0][0])))
-        if len(w) >= 8:                    # anchors are 8-64 hex (sb prints 16)
+        if len(w) >= 8:                    # anchors are 8 to 64 hex (sb prints 16)
             marks = [e for e in repo.journal_entries()
                      if e["link"].startswith(w)]
             if len(marks) > 1:
@@ -2114,9 +1985,8 @@ def _resolve_restore(repo, what):
     return uniq[0]
 
 def cmd_restore(args):
-    """Create a NEW save whose content equals the chosen past state.
-    Like undo, but to any point: nothing is rewound or deleted, and
-    running undo right after returns to the pre-restore state."""
+    # a new save whose content equals a past state. like undo, but to any
+    # point, and undo afterwards returns to where you were
     repo = need_repo()
     sync_locks(repo, quiet=True)
     head = repo.head_commit()
@@ -2128,7 +1998,7 @@ def cmd_restore(args):
     if commit_hash == head or c["tree"] == parse_commit(repo, head)["tree"]:
         print(green("already at that state — nothing to do"))
         return
-    target_tree = read_tree(repo, c["tree"])     # every blob re-hash-verified
+    target_tree = read_tree(repo, c["tree"])     # every blob rehashed on the way out
     cur_tree, _ = head_tree_files(repo)
     _checkout_preserving(repo, target_tree, cur_tree, foreign_locks(repo))
     with repo.transaction():            # commit point: one transaction
@@ -2139,18 +2009,11 @@ def cmd_restore(args):
     leaf(dim("history preserved — nothing deleted; sb undo returns you"))
 
 def _create_branch(repo, branch, head, allow_secrets=False):
-    """Create `branch` and give it an immediate first save of the working
-    folder, messaged "Initial branch creation".
-
-    A branch is therefore born with content: it can be switched to, tested,
-    and merged straight away, and there is no "save something first" step
-    and no branch that exists only as a name. Files another person holds a
-    lock on are taken from the last save instead of from disk — their
-    in-progress work is theirs to commit — and recognized credentials are
-    redacted exactly as a normal save redacts them. If the current branch
-    has never been saved, it is seeded with this same commit so both
-    branches start from one common first save (which is what makes an
-    immediate merge meaningful)."""
+    # create the branch and save the folder onto it at once, so a branch
+    # always has content and can be switched to, tested and merged straight
+    # away. files someone else has locked come from the last save, not from
+    # disk, and credentials are redacted as in any save. a current branch
+    # with no saves is seeded with the same commit, so both share a base
     name, email = author()
     keep = foreign_locks(repo)
     seeded = None
@@ -2180,8 +2043,7 @@ def _create_branch(repo, branch, head, allow_secrets=False):
         repo.update_ref(branch, h, op="branch", expect=None, extra=extra)
         cur = repo.current_branch()
         if cur != branch and not repo.tip(cur):
-            # nothing has ever been saved here: give the branch we are
-            # standing on the same first save, so the two share a base
+            # nothing saved yet, so give this branch the same first save
             repo.update_ref(cur, h, op="branch", expect=None,
                             extra={"initial": True, "seeded_from": branch})
             seeded = cur
@@ -2245,10 +2107,8 @@ def cmd_switch(args):
                    if target_commit else {})
     keep = foreign_locks(repo)
     work = snapshot_worktree(repo, write=False)
-    # If the folder is already exactly what the target branch holds, there is
-    # nothing to lose and nothing to write — this is what lets 'sb branch x'
-    # (which saves the folder onto x) be followed straight away by
-    # 'sb switch x' without an intervening save.
+    # if the folder already holds the target's tree there is nothing to lose
+    # and nothing to write, so branch then switch needs no save between
     if ({k: v for k, v in work.items() if k not in keep}
             != {k: v for k, v in target_tree.items() if k not in keep}):
         ensure_clean(repo)
@@ -2264,22 +2124,17 @@ def _parents(repo, h):
     return parse_commit(repo, h)["parents"]
 
 def find_merge_base(repo, a, b):
-    """Best common ancestor in the commit DAG. Returns a common ancestor
-    that has no descendant which is also a common ancestor (a lowest common
-    ancestor). A first-shared-commit DFS is wrong once merges exist, because
-    it can return an ancestor of the real base and feed the three-way merge a
-    stale base. When several independent LCAs exist (criss-cross history) the
-    result is deterministic (lowest commit time, then hash); such histories
-    are rare in sb's single-writer model, and a merge from a slightly older
-    base is conservative — it can only produce more conflicts, never a
-    silently wrong auto-merge."""
+    # lowest common ancestor: a common ancestor with no descendant that is
+    # also one. taking the first shared commit would hand the merge a stale
+    # base. with several candidates the pick is deterministic, by time then
+    # hash, and an older base only ever means more conflicts, never a wrong
+    # merge
     anc_a = {c["hash"] for c in walk_history(repo, a)}
     common = [c["hash"] for c in walk_history(repo, b) if c["hash"] in anc_a]
     if not common:
         return None
     common_set = set(common)
-    # discard any common ancestor that is itself an ancestor of another
-    # common ancestor — those are not "lowest"
+    # drop any common ancestor that is an ancestor of another one: not lowest
     dominated = set()
     for h in common:
         for p in _parents(repo, h):
@@ -2313,10 +2168,9 @@ def cmd_merge(args):
         die("current branch has no saves")
     if theirs_tip == ours_tip:
         print(green("already up to date")); return
-    # shared mode: a merge that would change a file someone else is actively
-    # editing (holds a lock on) is refused, so it can't clobber their work.
-    # --ignore skips those files: the merge proceeds for everything else and
-    # each locked file is kept at your current version, its lock untouched.
+    # a merge that would change someone else's locked file is refused.
+    # --ignore skips those: everything else merges, each skipped file keeps
+    # our version, and its lock stays
     name, email = author()
     ignore_locked = getattr(args, "ignore", False)
     skip = set()
@@ -2337,15 +2191,15 @@ def cmd_merge(args):
             f"sb merge {args.branch} --ignore")
     if ignore_locked:
         skip = {p for p, _ in blocked}
-    # everyone else's locked files are exempt from the clean check (they are
-    # preserved on disk, never merged over); the rest of the tree must be clean
+    # locked files are preserved, never merged over, so they do not count as
+    # unsaved work. the rest of the tree must be clean
     ensure_clean(repo, extra_exempt=skip)
     preserve = skip | foreign_locks(repo)
     base = find_merge_base(repo, ours_tip, theirs_tip)
     ours_tree = read_tree(repo, parse_commit(repo, ours_tip)["tree"])
     theirs_tree = read_tree(repo, parse_commit(repo, theirs_tip)["tree"])
-    # a clean fast-forward takes theirs wholesale, which would change skipped
-    # files — so only fast-forward when no skipped file actually differs
+    # a fast forward takes theirs whole, so only do it when nothing skipped
+    # actually differs
     ff_ok = base == ours_tip and not any(
         ours_tree.get(p) != theirs_tree.get(p) for p in skip)
     if ff_ok:
@@ -2371,8 +2225,8 @@ def cmd_merge(args):
         elif o == b:                      merged[rel] = t     # only they changed
         elif o is None or t is None:      conflicts.append((rel, "changed vs deleted"))
         else:
-            # both sides changed the same file: try a line-level 3-way merge,
-            # but only when every side can be reconstructed byte-for-byte
+            # both sides changed it, so merge by line, but only when every
+            # side rebuilds exactly
             bl = _mergeable_lines(repo, b[1] if b else None)
             ol = _mergeable_lines(repo, o[1])
             tl = _mergeable_lines(repo, t[1])
@@ -2403,26 +2257,22 @@ def cmd_merge(args):
                          commit=f"merge({short(ours_tip)},{short(theirs_tip)})"):
             die("pre-merge tests failed on the merged tree — merge blocked\n"
                 "       (fix on a branch and re-merge, or --no-verify to override)")
-    # write the merged tree, but DON'T touch preserved files on disk — their
-    # holders' in-progress edits must survive. We do this by telling checkout
-    # those paths are already correct (current == target for them).
+    # write the merged tree, telling checkout the preserved paths are
+    # already correct so it leaves them alone
     checkout_current = dict(ours_tree)
     checkout_target = dict(merged)
     for p in preserve:
         checkout_target[p] = ours_tree.get(p)
-        checkout_current[p] = ours_tree.get(p)   # marks as unchanged -> skipped
+        checkout_current[p] = ours_tree.get(p)   # reads as unchanged, so it is skipped
     checkout_target = {k: v for k, v in checkout_target.items() if v is not None}
     checkout_current = {k: v for k, v in checkout_current.items() if v is not None}
     _checkout_preserving(repo, checkout_target, checkout_current, preserve)
     with repo.transaction():            # commit point: one transaction
         tree_hash = build_tree(repo, merged)
-        # A merge that skipped locked files did NOT incorporate all of
-        # theirs — recording theirs_tip as a parent would be false ancestry:
-        # a later merge would say "already contains that branch" and the
-        # skipped changes could never arrive. A partial merge is therefore a
-        # single-parent commit; re-running the merge after the locks release
-        # picks up exactly the skipped files (everything else is content-
-        # identical by then and merges clean).
+        # a merge that skipped files did not take all of theirs, so naming
+        # their tip as a parent would claim ancestry we do not have and a
+        # later merge would call the branch already merged. partial merges
+        # get one parent, so rerunning later picks up what was skipped
         parents = [ours_tip] if skip else [ours_tip, theirs_tip]
         label = (f"partial merge {args.branch} into {repo.current_branch()} "
                  f"({len(skip)} locked file(s) skipped)" if skip else
@@ -2550,8 +2400,7 @@ def cmd_publish(args):
     leaf("store intact " + amber("\u2713"))
     c = parse_commit(repo, head)
     tree = read_tree(repo, c["tree"])
-    # record which gate scripts ran, by content hash, so the release record
-    # says exactly what was (or wasn't) checked
+    # record the gate scripts by content hash, so the release says what ran
     gate_scripts = {rel: h for rel, (mode, h) in tree.items()
                     if rel.startswith(f"{TESTS_DIR}/pre-publish/")}
     print(bold("gate 2/2") + dim(" · pre-publish tests on the HEAD tree"))
@@ -2576,8 +2425,8 @@ def cmd_publish(args):
                f"sb export {args.label or 'release'})"))
 
 def _verify(repo, quiet=False, anchor=None):
-    """Full store verification. Returns True if everything checks out.
-    Problems are tagged with a category so the summary never guesses."""
+    # full store verification. problems are tagged by category, so the
+    # summary never has to guess
     problems = []          # list of (category, message)
     def flag(cat, msg): problems.append((cat, msg))
     objects = 0
@@ -2590,7 +2439,7 @@ def _verify(repo, quiet=False, anchor=None):
         seen_trees.add(th)
         objects += 1
         try:
-            entries = json.loads(repo.get(th)[1] or b"[]")   # get() re-hashes
+            entries = json.loads(repo.get(th)[1] or b"[]")   # get() rehashes
             entries = [(m, k, h, n) for m, k, h, n in entries]
         except CorruptObject as e:
             flag("object", str(e)); return
@@ -2613,7 +2462,7 @@ def _verify(repo, quiet=False, anchor=None):
                 except CorruptObject as e:
                     flag("object", f"{e} ({name})")
 
-    # 1. every object reachable from every branch, re-hashed
+    # 1. every object reachable from every branch, rehashed
     for b in repo.branches():
         tip = repo.tip(b)
         if not tip:
@@ -2630,8 +2479,7 @@ def _verify(repo, quiet=False, anchor=None):
                     if isinstance(e, KeyError) else str(e))
             flag("object", f"branch {b}: {what}")
 
-    # 1b. saves kept from removed branches: 'sb branch -r' keeps their
-    #     history, so verify keeps checking it.
+    # 1b. history from removed branches is kept, so it is checked too
     reachable = len(seen_commits)
     for (ch,) in repo.db.execute(
             "SELECT hash FROM objects WHERE kind='commit'").fetchall():
@@ -2650,9 +2498,8 @@ def _verify(repo, quiet=False, anchor=None):
             flag("object", f"removed-branch save {short(ch)}: {what}")
     unreachable = len(seen_commits) - reachable
 
-    # 1c. remaining rows (orphaned blobs/trees left by an interrupted
-    #     operation, or the in-progress content a lock is protecting):
-    #     re-hash those too, so every stored object is checked.
+    # 1c. the rest: orphans from interrupted work and content held by locks,
+    #     so that no stored object goes unchecked
     for h, kind in repo.db.execute("SELECT hash, kind FROM objects").fetchall():
         if h in seen_commits or h in seen_trees or h in seen_blobs:
             continue
@@ -2673,10 +2520,8 @@ def _verify(repo, quiet=False, anchor=None):
         chain_ok = False
         flag("journal", str(e))
 
-    # 3. branch tips must match what the journal last recorded — a ref
-    #    edited behind sb's back (e.g. direct SQL) is caught here. Iterating
-    #    the journal can itself fail on a tampered row; that is a finding,
-    #    not a crash.
+    # 3. tips must match what the journal last recorded, which catches a ref
+    #    edited outside sb. a tampered row is a finding here, not a crash
     expected = {}
     try:
         for e in repo.journal_entries():
@@ -2695,8 +2540,8 @@ def _verify(repo, quiet=False, anchor=None):
                          f"journal last recorded {short(expected[b])} "
                          f"(moved outside sb?)")
         elif b not in expected and cur:
-            # a non-empty ref the journal has never heard of was injected
-            # outside sb (direct SQL); an empty ref is just a fresh branch
+            # a ref the journal never recorded was injected outside sb.
+            # an empty one is just a branch with no saves
             flag("refs", f"branch '{b}' ({short(cur)}) exists in refs but "
                          f"was never recorded in the journal "
                          f"(added outside sb?)")
@@ -2705,9 +2550,8 @@ def _verify(repo, quiet=False, anchor=None):
             flag("refs", f"branch '{b}' exists in the journal but was "
                          f"removed from refs outside sb")
 
-    # 4. optional external anchor: is this (prefix of a) link in the chain?
-    #    Anchors are 16-hex prefixes (64 bits) — short enough to jot down and
-    #    paste back, far too long for a forged entry to collide with.
+    # 4. optional anchor: is this prefix a link in the chain? 16 hex chars
+    #    is 64 bits, short enough to write down, too long to collide with
     anchor_ok = False
     if anchor:
         a = anchor.strip().lower().rstrip(".\u2026")   # forgive a pasted ellipsis
@@ -2929,10 +2773,8 @@ def cmd_unlock(args):
             + ", ".join(sorted(denied)[:4]))
 
 def cmd_salvage(args):
-    """Write any stored content back out to a file. Its main use is the
-    other side of a lock revert: when your edit to someone else's locked
-    file is put back, the bytes you wrote are stored and their hash printed
-    (and journaled), so nothing you typed is ever actually destroyed."""
+    # write any stored content back out to a file. mainly the other half of
+    # a lock revert, which stores the bytes it displaces and prints the hash
     repo = need_repo()
     h = (args.hash or "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{4,64}", h):
@@ -2946,7 +2788,7 @@ def cmd_salvage(args):
     if len(rows) > 1:
         die(f"'{h}' matches {len(rows)} stored objects — give more characters")
     full = rows[0][0]
-    data = repo.get(full)[1]                    # re-hashed on read
+    data = repo.get(full)[1]                    # rehashed on read
     dest = Path(args.dest) if args.dest else Path(f"salvaged-{short(full)}")
     if dest.exists():
         die(f"{dest} already exists — choose another name")
@@ -2967,6 +2809,13 @@ def cmd_who(args):
             os.chmod(CONFIG_FILE, 0o600)
         except OSError:
             pass
+        # written under sudo it would be a root owned file in someone's
+        # home, which they could no longer update
+        su = _sudo_user()
+        if su and not os.environ.get("SB_HOME"):
+            for target in (CONFIG_FILE, CONFIG_DIR):
+                with contextlib.suppress(OSError):
+                    os.chown(target, su[0], su[1])
     name, email = author()
     print(f"saves are recorded as {bold(name)} <{email}>")
     leaf(dim(f"config {CONFIG_FILE}  ·  env SB_NAME / SB_EMAIL override"))
@@ -2984,13 +2833,11 @@ def cmd_ignore(args):
     leaf(dim(".sbignore updated"))
 
 def cmd_selftest(args):
-    """Adversarial self-test. Exercises the failure classes a source-history
-    tool must survive: crash injection at the ref/journal boundary, symlink
-    escape and file/directory path safety, save consistency under mid-gate
-    mutation, merge byte-fidelity, compare-and-swap under concurrent saves,
-    full-store verification, archive salt uniqueness, branch bootstrapping,
-    and the shared content-lock model.
-    Exits 0 if everything passes, non-zero otherwise."""
+    # adversarial self test: crash injection at the ref and journal
+    # boundary, symlink escapes, files swapping with directories, mutation
+    # during a gate, merge fidelity, racing saves, store verification,
+    # archive salt, branch bootstrapping and the content lock model.
+    # exits 0 when everything passes
     import shutil as _sh, threading as _th, io as _io, tarfile as _tar
     import sqlite3 as _sql, zlib as _zl
     SELF = str(Path(__file__).resolve())
@@ -3313,9 +3160,8 @@ def cmd_selftest(args):
 
     @case
     def lock_content_wins():
-        """The 1.4 rule: a locked file IS its holder's version. Anyone may
-        type into it; on the next command their bytes are put back and kept
-        in the store, and only the holder can commit it."""
+        # a locked file is its holder's version. anyone can type into it,
+        # but the next command puts it back and keeps their bytes
         d, old = fresh(); os.chdir(d)
         xd = Path(tempfile.mkdtemp(prefix="sbexp-"))
         env0 = dict(os.environ)
@@ -3379,7 +3225,7 @@ def cmd_selftest(args):
             as_user("Lead", "l@co", "init")
             Path("a.py").write_text("v1"); Path("b.py").write_text("v1")
             as_user("Lead", "l@co", "save", "seed")   # shared is always on
-            # alice edits a.py, bob edits b.py — independent locks
+            # alice edits a.py, bob edits b.py, so two locks
             Path("a.py").write_text("alice"); as_user("Alice", "a@co", "status")
             Path("b.py").write_text("bob"); as_user("Bob", "b@co", "status")
             repo = Repo(Path(".").resolve())
@@ -3387,7 +3233,7 @@ def cmd_selftest(args):
             check("shared: independent edits lock to their own users",
                   locks.get("a.py", {}).get("email") == "a@co"
                   and locks.get("b.py", {}).get("email") == "b@co")
-            # bob saves — only b.py committed, a.py stays at v1 in history
+            # bob saves, so only b.py lands and a.py stays at v1
             as_user("Bob", "b@co", "save", "bob edit")
             as_user("Lead", "l@co", "export", "main", str(xd / "chk1"))
             check("shared: save commits only your files",
@@ -3395,9 +3241,8 @@ def cmd_selftest(args):
                   and (xd / "chk1/b.py").read_text() == "bob")
             check("shared: others' locks survive your save",
                   "a.py" in Repo(Path(".").resolve()).locks())
-            # expiry auto-saves the abandoned edit (attributed to alice),
-            # then auto-reverts it — history AND disk return to v1, and the
-            # saved edit is recoverable via sb restore <auto-save hash>
+            # expiry saves the abandoned edit under alice, then reverts it,
+            # so history and disk both return to v1 and sb restore gets it
             os.environ["SB_LOCK_TTL"] = "1"; time.sleep(2)
             r = as_user("Lead", "l@co", "status")
             as_user("Lead", "l@co", "export", "main", str(xd / "chk2"))
@@ -3414,7 +3259,7 @@ def cmd_selftest(args):
             if rr is not None:              # put the tree back for what follows
                 as_user("Lead", "l@co", "undo")
             del os.environ["SB_LOCK_TTL"]
-            # merge --ignore skips a locked file, leaving it and its lock alone
+            # merge --ignore skips a locked file and leaves its lock alone
             Path("c.py").write_text("base"); as_user("Lead", "l@co", "save", "c base")
             as_user("Lead", "l@co", "branch", "feat")
             as_user("Lead", "l@co", "switch", "feat")
@@ -3423,7 +3268,7 @@ def cmd_selftest(args):
             Path("c.py").write_text("carol edit"); as_user("Carol", "c@co", "status")
             r = as_user("Lead", "l@co", "merge", "feat")
             blocked = r.returncode != 0 and "locked" in (r.stdout + r.stderr).lower()
-            # --ignore: merge proceeds, c.py kept at our version, lock survives
+            # merge proceeds, c.py keeps our version, the lock survives
             r2 = as_user("Lead", "l@co", "merge", "feat", "--ignore")
             repo2 = Repo(Path(".").resolve())
             as_user("Lead", "l@co", "export", "main", str(xd / "chk3"))
@@ -3432,7 +3277,7 @@ def cmd_selftest(args):
                           and "c.py" in repo2.locks())
             check("shared: merge blocked by lock; --ignore skips it, lock kept",
                   blocked and skipped_ok)
-            # unlock releases a held lock (Carol's, via --force)
+            # unlock --force releases carol's lock
             r3 = as_user("Lead", "l@co", "unlock", "c.py", "--force")
             check("shared: sb unlock --force releases others' lock",
                   r3.returncode == 0
@@ -3457,19 +3302,18 @@ def cmd_selftest(args):
         sys.exit(1)
     leaf(green(f"all {len(passed)} checks passed"))
 
-# ------------------------------------------------------- portable archive ---
-# 'sb pack' seals the entire repository (the single sandbox.db) plus a small
-# manifest into one encrypted .sbox file; 'sb unpack' reverses it. Encryption
-# is provided by vox (embedded below), so both commands work fully offline.
+# portable archive
+# 'sb pack' seals the database and a small manifest into one encrypted
+# .sbox file, 'sb unpack' reverses it. encryption comes from vox, embedded
+# below, so both work offline
 SBOX_MAGIC = b"SBOX"
-SBOX_VERSION = 2      # v2 adds a random 16-byte per-archive salt (see below)
+SBOX_VERSION = 2      # v2 mixes a random salt into the key
 SBOX_SALT_LEN = 16
 
 def _sbox_seal(vox, manifest, body, passphrase):
-    """Encrypt an archive with a fresh random salt mixed into the key, so two
-    archives sealed with the same passphrase derive different keys and an
-    attacker cannot amortize a password guess across archives. The salt lives
-    in the (authenticated) cleartext header."""
+    # a fresh random salt goes into the key, so two archives sealed with one
+    # passphrase get different keys and a guess cannot be reused across
+    # them. the salt sits in the header, which is authenticated
     salt = os.urandom(SBOX_SALT_LEN)
     header = SBOX_MAGIC + bytes([SBOX_VERSION]) + salt
     eff_key = salt.hex() + ":" + passphrase
@@ -3477,8 +3321,8 @@ def _sbox_seal(vox, manifest, body, passphrase):
     return header + blob
 
 def _sbox_open(vox, raw, passphrase):
-    """Inverse of _sbox_seal. Handles v2 (salted) and v1 (legacy, fixed-salt)
-    archives so older .sbox files still open."""
+    # inverse of _sbox_seal. handles both salted and older fixed salt
+    # archives, so old .sbox files still open
     ver = raw[4]
     if ver >= 2:
         salt = raw[5:5 + SBOX_SALT_LEN]
@@ -3489,9 +3333,8 @@ def _sbox_open(vox, raw, passphrase):
     header, blob = raw[:5], raw[5:]          # v1: passphrase used directly
     return vox.decrypt(blob, passphrase, associated_data=header)
 
-# vox v1.7.3 (jts.gg/vox) — embedded verbatim so pack/unpack work fully
-# offline. It is loaded into an in-memory module only when those two
-# commands run; nothing else in sb touches it.
+# vox v1.7.3 (jts.gg/vox), embedded verbatim. loaded into memory only while
+# pack, unpack or export runs. nothing else uses it
 VOX_SOURCE = r"""
 #  Vox Encryption Module      v1.7.3
 #  Documentation          jts.gg/vox
@@ -3682,7 +3525,7 @@ def _derive_keystream(
 """
 
 def load_vox():
-    """Load the embedded vox module in memory (no disk, no network)."""
+    # Load the embedded vox module in memory (no disk, no network).
     import types
     mod = types.ModuleType("vox")
     try:
@@ -3698,10 +3541,8 @@ def _frame(manifest: dict, db: bytes) -> bytes:
     return len(head).to_bytes(4, "big") + head + db
 
 def _write_archive(out: Path, data: bytes):
-    """Write a sealed archive next to its final name via a randomized,
-    exclusively-created temp file (O_EXCL + no-follow), then atomically
-    rename it into place. A predictable temp name in a shared directory
-    could be pre-planted as a symlink; this cannot be."""
+    # write to a randomized O_EXCL temp file beside the final name, then
+    # rename it in. a predictable name could be planted as a symlink
     tmp = out.with_name(f".{out.name}.{os.urandom(6).hex()}.sbtmp")
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW,
                  0o600)
@@ -3735,7 +3576,7 @@ def _unframe(payload: bytes):
     return manifest, payload[4 + n:]
 
 def _snapshot_db(repo: Repo) -> bytes:
-    """A consistent single-file copy of the store, WAL folded in."""
+    # a consistent single file copy of the store, with the WAL folded in
     src = repo.vdir / DB_NAME
     tmp = Path(tempfile.mkdtemp(prefix="sb-pack-")) / "snap.db"
     con = sqlite3.connect(str(src))
@@ -3748,7 +3589,7 @@ def _snapshot_db(repo: Repo) -> bytes:
     return data
 
 def _tar_tree(repo, tree) -> bytes:
-    """Serialize a saved tree's files into an in-memory tar."""
+    # serialize a saved tree's files into a tar in memory
     import tarfile, io
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as t:
@@ -3763,10 +3604,8 @@ def _tar_tree(repo, tree) -> bytes:
     return buf.getvalue()
 
 def _untar_files(data: bytes, dest: Path) -> int:
-    """Extract an archive's files into dest. Names are validated lexically,
-    then every write goes through a no-follow, descriptor-relative path so a
-    pre-existing symlinked parent in the destination can never redirect a
-    write outside dest (the same protection checkout uses)."""
+    # extract the archive's files into dest. names are checked first, then
+    # written the same symlink safe way checkout writes
     import tarfile, io
     dest.mkdir(parents=True, exist_ok=True)
     root_fd = os.open(str(dest), os.O_RDONLY | _O_DIRECTORY)
@@ -3893,8 +3732,8 @@ def cmd_unpack(args):
     dest = Path(dest_name) if dest_name else Path(manifest.get("repo_name", "sandbox"))
     if dest.exists() and not dest.is_dir():
         die(f"{dest} exists and is not a folder — choose another destination")
-    # any non-empty destination counts as merging; a plain folder of
-    # files gets the same protection as an existing repository
+    # any destination with something in it counts as merging, so a folder of
+    # loose files gets the same protection as a repository
     merging = dest.is_dir() and any(dest.iterdir())
     if merging and not args.ignore:
         what = (f"{dest / SB_DIR} (an sb repository)"
@@ -3907,13 +3746,13 @@ def cmd_unpack(args):
     files_only = args.files_only or kind == "files"
 
     if kind == "files":
-        # archive holds files, no history — extraction is inherently files-only
+        # the archive holds files and no history, so only files come out
         dest.mkdir(parents=True, exist_ok=True)
         n = _untar_files(body, dest)
         held = "files only — this archive carries no history"
     elif files_only:
-        # full-history archive, but the user wants just the native files:
-        # restore the store in a temp area, check out from there, keep no .sb
+        # full history, but only the files are wanted: restore the store in
+        # a temp area, check out from there, keep no .sb
         stage = Path(tempfile.mkdtemp(prefix="sb-unpack-"))
         try:
             (stage / SB_DIR).mkdir()
@@ -3926,9 +3765,9 @@ def cmd_unpack(args):
             shutil.rmtree(stage, ignore_errors=True)
         held = "files only — history was in the archive but not written"
     else:
-        # full repository: stage the store in a private temp area and verify
-        # it END TO END before a single byte lands in the destination — a
-        # damaged or hostile archive must not leave a half-installed repo
+        # full repository: stage the store and verify it end to end before a
+        # byte reaches the destination, so a damaged archive cannot leave a
+        # half installed repo
         stage = Path(tempfile.mkdtemp(prefix="sb-unpack-"))
         try:
             (stage / SB_DIR).mkdir()
@@ -3960,8 +3799,8 @@ def cmd_unpack(args):
             die(f"{db_path} is a symlink — refusing to install the store "
                 "through it")
         if merging:
-            # replacing an existing store: drop any stale WAL/SHM sidecars so
-            # SQLite cannot pair old write-ahead pages with the new database
+            # drop stale WAL and SHM sidecars, so SQLite cannot pair old
+            # pages with the new database
             for side in ("-wal", "-shm"):
                 stale = db_path.with_name(DB_NAME + side)
                 if stale.exists():
@@ -4006,8 +3845,8 @@ def cmd_unpack(args):
     tree_print(rows)
 
 def _resolve_version(repo, what):
-    """Resolve a release label, branch name, or save-hash prefix to a commit.
-    Returns (commit_hash, human description of how it matched)."""
+    # resolve a release label, branch or hash prefix to a commit, with a
+    # readable note of how it matched
     recs = [e for e in repo.journal_entries()
             if e["op"] in ("publish", "deploy")
             and e["detail"].get("label") == what]
@@ -4097,10 +3936,8 @@ def cmd_export(args):
     ])
 
 def _get_key(args, *, confirm=False):
-    """Resolve the archive pass-key. Precedence: -k, then SB_PASSKEY, then an
-    interactive getpass prompt. Passing -k on the command line is convenient
-    but exposes the key to shell history and process listings; the prompt and
-    the env var avoid that."""
+    # the pass key: -k, then SB_PASSKEY, then a prompt. -k is convenient but
+    # exposes the key to shell history and process listings
     if args.key:
         return args.key
     env = os.environ.get("SB_PASSKEY")
@@ -4118,9 +3955,8 @@ def _get_key(args, *, confirm=False):
     return key
 
 def _share_parser(cmd):
-    """Uniform parser for pack / unpack / export. Options may appear
-    anywhere on the line (parse_intermixed_args), same as every other
-    sb command; there are no legacy positional-key forms."""
+    # one parser for pack, unpack and export. options may appear anywhere on
+    # the line, and the pass key has no positional form
     sp = SBParser(prog=f"sb {cmd}", add_help=False)
     sp.add_argument("params", nargs="*")
     sp.add_argument("-k", "--key", metavar="<passkey>")
@@ -4129,8 +3965,8 @@ def _share_parser(cmd):
     if cmd == "unpack":
         sp.add_argument("-i", "--ignore", action="store_true")
     return sp
-# ---------------------------------------------------------------- CLI -------
-# One usage line per command, shown when its arguments don't parse.
+# CLI
+# one usage line per command, shown when its arguments do not parse
 USAGES = {
     "sb":         "sb <command> [arguments]",
     "sb save":    'sb save "<message>" [--allow-secrets] [--no-verify]',
@@ -4158,19 +3994,19 @@ USAGES = {
 }
 
 def _arg_error(prog, message):
-    """Report an argument failure in sb's own error style: the cleaned
-    message, that command's usage line, and a pointer to the menu."""
-    # asking for help is not an error — show the menu and leave happy
+    # report an argument failure in sb's style: the cleaned message, that
+    # command's usage line, and a pointer to the menu
+    # asking for help is not an error: show the menu and exit 0
     if "unrecognized arguments" in message and \
             any(t in message.split() for t in ("-h", "--help")):
         print(HELP)
         sys.exit(0)
-    # a mistyped command gets a short, human answer, not a choice dump
+    # a mistyped command gets one short line, not a dump of every choice
     m = re.search(r"invalid choice: '([^']*)'", message)
     if m:
         die(f"'{m.group(1)}' is not an sb command\n"
             f"       see the full menu:  sb help")
-    # everything else: cleaned-up argparse message + the right usage line
+    # everything else: tidied argparse message plus the right usage line
     message = message.replace(
         "the following arguments are required:", "missing:")
     lines = [f"{prog}: {message}"]
@@ -4180,8 +4016,7 @@ def _arg_error(prog, message):
     die("\n".join(lines))
 
 class SBParser(argparse.ArgumentParser):
-    """argparse that reports failures through _arg_error instead of the
-    stock usage dump."""
+    # argparse reporting failures through _arg_error, not its usage dump
 
     def __init__(self, *a, **kw):
         kw.setdefault("add_help", False)
@@ -4196,8 +4031,7 @@ def _row(cmd, desc, last=False):
     return f"  {conn} {cmd.ljust(CMD_W)}{dim(desc)}"
 
 def _opt(flag, desc, cont=True):
-    """An option line, indented beneath its command — visually subordinate,
-    never mistakable for a command of its own."""
+    # an option line, indented under its command so it never reads as one
     bar = amber("\u2502") if cont else " "
     return f"  {bar}       {dim(flag.ljust(CMD_W - 3))}{dim(desc)}"
 
@@ -4275,8 +4109,8 @@ def main(argv=None):
     if argv[0] in ("-V", "--version", "version"):
         print(f"sb {VERSION} · {AUTHOR}"); return
     if argv[0] in ("pack", "unpack", "export"):
-        # parse_intermixed_args lets options sit anywhere among positionals,
-        # e.g. 'sb unpack backup.sbox -k KEY restored'
+        # options may sit anywhere among positionals:
+        # 'sb unpack backup.sbox -k KEY restored'
         args = _share_parser(argv[0]).parse_intermixed_args(argv[1:])
         args.cmd = argv[0]
     else:
@@ -4320,8 +4154,8 @@ def main(argv=None):
         who.add_argument("email", nargs="?")
         gp = sub.add_parser("ignore"); gp.add_argument("pattern")
         sub.add_parser("selftest")
-        # parse_known_args so leftovers can be blamed on the command the
-        # user actually typed ('sb log: ...'), not the bare 'sb' parser
+        # parse_known_args, so leftovers are blamed on the command that was
+        # typed ('sb log: ...') rather than the bare 'sb' parser
         args, extra = p.parse_known_args(argv)
         if extra:
             prog = f"sb {args.cmd}" if args.cmd else "sb"
@@ -4343,7 +4177,7 @@ def main(argv=None):
         die(f"store error: {e} — the database may be locked or damaged; "
             f"run 'sb verify'")
     except BrokenPipeError:
-        raise                            # handled by the top-level guard
+        raise                            # handled by the guard at the bottom
     except OSError as e:
         die(f"file system error: {e}")
 
