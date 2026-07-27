@@ -4,12 +4,14 @@
 
 import sys, os, io, json, time, zlib, hashlib, fnmatch, difflib, re
 import argparse, contextlib
-import sqlite3, subprocess, tempfile, getpass, shutil
+import sqlite3, subprocess, tempfile, getpass, shutil, stat
 from pathlib import Path
 
 VERSION = "1.3"
 AUTHOR = "jts.gg/sandbox"
 FORMAT_VERSION = 1
+CHUNK_THRESHOLD = 8 * 1024 * 1024   # bigger than this is stored in pieces
+CHUNK_SIZE = 1024 * 1024            # one piece
 SB_DIR = ".sb"
 DB_NAME = "sandbox.db"
 
@@ -17,7 +19,7 @@ DB_NAME = "sandbox.db"
 REF_OPS = ("save", "merge", "undo", "restore", "branch", "ref",
            "autosave")
 
-# output
+# === output ===
 # three colors: bold white, dim gray, one amber accent. red means failure
 def _c(code, s):
     return f"\033[{code}m{s}\033[0m" if sys.stdout.isatty() else str(s)
@@ -29,7 +31,6 @@ def red(s):    return _c("31", s)            # red: failures only
 def green(s):  return bold(s)                # success reads as bold white
 def yellow(s): return amber(s)               # highlights / ids read as amber
 def cyan(s):   return amber(s)               # paths / ids read as amber
-RULE = "\u2500" * 34
 
 def tree_print(lines, indent="  "):
     # Print lines under the previous message with light connector glyphs.
@@ -55,7 +56,7 @@ class TamperedJournal(Exception):
     # The journal hash chain does not verify.
     pass
 
-# hashing
+# === hashing ===
 def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -64,10 +65,22 @@ def canonical(obj) -> bytes:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"),
                       ensure_ascii=False).encode()
 
+def hash_file(path, size):
+    # the same hash as a blob of that content, read a piece at a time
+    hasher = hashlib.sha256()
+    hasher.update(f"blob {size}\0".encode())
+    with open(path, "rb") as f:
+        while True:
+            c = f.read(CHUNK_SIZE)
+            if not c:
+                break
+            hasher.update(c)
+    return hasher.hexdigest()
+
 def hash_obj(kind: str, data: bytes) -> str:
     return sha256_hex(f"{kind} {len(data)}\0".encode() + data)
 
-# the store
+# === the store ===
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -107,7 +120,8 @@ CREATE TABLE IF NOT EXISTS locks (
     base   TEXT NOT NULL DEFAULT '',
     held   TEXT NOT NULL DEFAULT '',
     mode   TEXT NOT NULL DEFAULT '100644',
-    uid    INTEGER NOT NULL DEFAULT -1
+    uid    INTEGER NOT NULL DEFAULT -1,
+    perm   INTEGER NOT NULL DEFAULT -1
 );
 """
 
@@ -226,8 +240,11 @@ class Repo:
             if "uid" not in cols:
                 self.db.execute("ALTER TABLE locks ADD COLUMN "
                                 "uid INTEGER NOT NULL DEFAULT -1")
+            if "perm" not in cols:
+                self.db.execute("ALTER TABLE locks ADD COLUMN "
+                                "perm INTEGER NOT NULL DEFAULT -1")
 
-    # meta
+    # === meta ===
     def meta(self, key, default=None):
         row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
         return row[0] if row else default
@@ -239,14 +256,144 @@ class Repo:
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (key, str(value)))
 
-    # object store
+    # === object store ===
+    # a big file is stored as a list of chunk hashes rather than one blob,
+    # so a later version of it only costs the chunks that actually changed
+    # and no single read has to hold the whole thing
     def put(self, kind: str, data: bytes) -> str:
+        if kind == "blob" and len(data) >= CHUNK_THRESHOLD:
+            h = hash_obj(kind, data)
+            if self.has(h):
+                return h
+            return self._put_chunks(
+                h, len(data),
+                (data[i:i + CHUNK_SIZE]
+                 for i in range(0, len(data), CHUNK_SIZE)))
         h = hash_obj(kind, data)
         with self.transaction():
             self.db.execute(
                 "INSERT OR IGNORE INTO objects(hash,kind,size,data) VALUES(?,?,?,?)",
                 (h, kind, len(data), zlib.compress(data)))
         return h
+
+    def _put_chunks(self, h, size, chunks):
+        refs = []
+        with self.transaction():
+            for c in chunks:
+                ch = hash_obj("chunk", c)
+                if not self.has(ch):
+                    self.db.execute(
+                        "INSERT OR IGNORE INTO objects(hash,kind,size,data) "
+                        "VALUES(?,'chunk',?,?)",
+                        (ch, len(c), zlib.compress(c)))
+                refs.append(ch)
+            body = canonical(refs)
+            self.db.execute(
+                "INSERT OR IGNORE INTO objects(hash,kind,size,data) "
+                "VALUES(?,'chunked',?,?)", (h, size, zlib.compress(body)))
+        return h
+
+    def put_file(self, path, size, known_hash=None):
+        # store a file without ever holding it whole: hash and chunk as it
+        # is read. small files take the ordinary blob path
+        if size < CHUNK_THRESHOLD:
+            return self.put("blob", Path(path).read_bytes())
+        if known_hash and self.has(known_hash):
+            return known_hash         # already stored: nothing to re-read
+        hasher = hashlib.sha256()
+        hasher.update(f"blob {size}\0".encode())
+        refs, total = [], 0
+        with self.transaction():
+            with open(path, "rb") as f:
+                while True:
+                    c = f.read(CHUNK_SIZE)
+                    if not c:
+                        break
+                    total += len(c)
+                    hasher.update(c)
+                    ch = hash_obj("chunk", c)
+                    if not self.has(ch):
+                        self.db.execute(
+                            "INSERT OR IGNORE INTO objects"
+                            "(hash,kind,size,data) VALUES(?,'chunk',?,?)",
+                            (ch, len(c), zlib.compress(c)))
+                    refs.append(ch)
+            if total != size:
+                raise CheckoutConflict(
+                    f"{path} changed size while it was being read")
+            h = hasher.hexdigest()
+            self.db.execute(
+                "INSERT OR IGNORE INTO objects(hash,kind,size,data) "
+                "VALUES(?,'chunked',?,?)",
+                (h, size, zlib.compress(canonical(refs))))
+        return h
+
+    def _chunk_refs(self, blob):
+        try:
+            refs = json.loads(zlib.decompress(blob))
+        except (zlib.error, ValueError):
+            raise CorruptObject("a chunk list in the store is unreadable")
+        if not isinstance(refs, list) or not all(isinstance(r, str) for r in refs):
+            raise CorruptObject("a chunk list in the store is malformed")
+        return refs
+
+    def _chunk_data(self, ref):
+        row = self.db.execute(
+            "SELECT kind, data FROM objects WHERE hash=?", (ref,)).fetchone()
+        if row is None:
+            raise CorruptObject(f"chunk {short(ref)} is missing from the store")
+        kind, blob = row
+        try:
+            data = zlib.decompress(blob)
+        except zlib.error:
+            raise CorruptObject(f"chunk {short(ref)} is unreadable")
+        if hash_obj(kind, data) != ref:
+            raise CorruptObject(f"chunk {short(ref)} does not match its hash")
+        return data
+
+    def stream(self, h):
+        # yield an object's bytes piece by piece, for writing straight out.
+        # each chunk is checked as it goes AND the reassembled whole is
+        # checked at the end: a chunk list that was reordered or repointed
+        # at other valid chunks passes every per chunk check, so without
+        # the running hash a tampered list would write out silently.
+        # callers write through an atomic temp file, so raising at the end
+        # means nothing is left on disk
+        row = self.db.execute(
+            "SELECT kind, size, data FROM objects WHERE hash=?",
+            (h,)).fetchone()
+        if row is None:
+            raise KeyError(h)
+        kind, size, blob = row
+        if kind != "chunked":
+            yield self.get(h)[1]
+            return
+        hasher = hashlib.sha256()
+        hasher.update(f"blob {int(size)}\0".encode())
+        total = 0
+        for ref in self._chunk_refs(blob):
+            data = self._chunk_data(ref)
+            total += len(data)
+            hasher.update(data)
+            yield data
+        if total != int(size) or hasher.hexdigest() != h:
+            raise CorruptObject(
+                f"object {short(h)} does not match its hash "
+                f"(its chunk list is wrong)")
+
+    def verify_object(self, h):
+        # check an object without materializing it. a chunked file is
+        # verified a piece at a time, so verify costs one chunk of memory
+        # however large the file is. raises KeyError or CorruptObject
+        row = self.db.execute(
+            "SELECT kind, size FROM objects WHERE hash=?", (h,)).fetchone()
+        if row is None:
+            raise KeyError(h)
+        if row[0] != "chunked":
+            self.get(h)
+            return
+        for _ in self.stream(h):     # stream checks each chunk and the whole
+            pass
 
     def has(self, h: str) -> bool:
         return self.db.execute(
@@ -259,6 +406,12 @@ class Repo:
         if row is None:
             raise KeyError(h)
         kind, blob = row
+        if kind == "chunked":
+            data = b"".join(self._chunk_data(r) for r in self._chunk_refs(blob))
+            if hash_obj("blob", data) != h:
+                raise CorruptObject(
+                    f"object {short(h)} content does not match its hash")
+            return "blob", data
         try:
             data = zlib.decompress(blob)
         except zlib.error:
@@ -284,7 +437,7 @@ class Repo:
                 die(f"'{name_or_prefix}' is ambiguous — give more characters")
         return None
 
-    # refs / branch pointer
+    # === refs / branch pointer ===
     def current_branch(self):
         return self.meta("branch")
 
@@ -329,7 +482,7 @@ class Repo:
             self.journal("branch-remove", {"branch": branch, "old": old or "",
                                            "new": ""})
 
-    # journal
+    # === journal ===
     def chain_head(self):
         row = self.db.execute(
             "SELECT link FROM journal ORDER BY seq DESC LIMIT 1").fetchone()
@@ -379,7 +532,7 @@ class Repo:
             n += 1
         return n, head
 
-    # stat cache
+    # === stat cache ===
     # keyed on size, mtime, ctime, inode. mtime alone can be forged from
     # userspace, so ctime and inode are what catch a same size edit
     def cached_hash(self, rel, size, mtime_ns, ctime_ns, ino):
@@ -400,29 +553,33 @@ class Repo:
                 "mtime=excluded.mtime, ctime=excluded.ctime, "
                 "ino=excluded.ino, hash=excluded.hash", entries)
 
-    # locks
+    # === locks ===
     def locks(self):
         # {path: {owner, email, since, base, held, mode, uid}}. held is the
         # content being protected, LOCK_DELETED if the holder deleted it, or
         # empty for a lock older than content tracking
         out = {}
-        for path, owner, email, since, base, held, mode, uid in self.db.execute(
-                "SELECT path,owner,email,since,base,held,mode,uid FROM locks"):
+        for (path, owner, email, since, base, held, mode, uid,
+             perm) in self.db.execute(
+                "SELECT path,owner,email,since,base,held,mode,uid,perm "
+                "FROM locks"):
             out[path] = {"owner": owner, "email": email, "since": since,
                          "base": base, "held": held or "",
                          "mode": mode or "100644",
-                         "uid": -1 if uid is None else int(uid)}
+                         "uid": -1 if uid is None else int(uid),
+                         "perm": -1 if perm is None else int(perm)}
         return out
 
     def set_lock(self, path, owner, email, base, held="", mode="100644",
-                 uid=-1):
+                 uid=-1, perm=-1):
         with self.transaction():
             self.db.execute(
-                "INSERT INTO locks(path,owner,email,since,base,held,mode,uid) "
-                "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(path) DO NOTHING",
+                "INSERT INTO locks(path,owner,email,since,base,held,mode,uid,"
+                "perm) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO NOTHING",
                 (path, owner, email, int(time.time()), base or "",
                  held or "", mode or "100644",
-                 -1 if uid is None else int(uid)))
+                 -1 if uid is None else int(uid),
+                 -1 if perm is None else int(perm)))
 
     def update_lock_held(self, path, held, mode, touch=True):
         # the holder edited again, so protect the new content. touch resets
@@ -458,7 +615,7 @@ def need_repo() -> Repo:
             pass
     return repo
 
-# identity
+# === identity ===
 # who made each save, for humans reading history. no keys, no signatures:
 # attribution, not authentication
 def _sudo_user():
@@ -502,7 +659,7 @@ def author():
     email = os.environ.get("SB_EMAIL") or prof.get("email") or f"{name}@local"
     return name, email
 
-# ignores
+# === ignores ===
 DEFAULT_IGNORES = [SB_DIR, "*.sbox", "*.pyc", "__pycache__", ".DS_Store",
                    ".git", "node_modules"]
 
@@ -525,7 +682,7 @@ def is_ignored(rel: str, pats) -> bool:
             return True
     return False
 
-# secret scanner
+# === secret scanner ===
 # stop credentials entering permanent history. a recognized one in clean
 # UTF-8 text becomes <REDACTED> in the blob being committed, leaving the
 # file on disk alone. a file that cannot be rewritten faithfully blocks
@@ -540,19 +697,35 @@ SECRET_PATTERNS = [
     ("JWT",                   re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b")),
     ("generic secret assign", re.compile(r"(?i)\b(api[_-]?key|secret|passwd|password|auth[_-]?token)\b\s*[:=]\s*['\"][^'\"\s]{12,}['\"]")),
 ]
-MAX_SCAN_BYTES = 1_000_000
+MAX_SCAN_BYTES = 64 * 1024 * 1024      # text this big is still worth scanning
+SCAN_WINDOW = 4 * 1024 * 1024          # decoded a window at a time, not whole
 
 def scan_secrets(data: bytes):
-    # Return [(line_no, label), ...] findings for one file's content.
+    # [(line_no, label), ...] for one file's content
     if len(data) > MAX_SCAN_BYTES or b"\0" in data[:8000]:
-        return []                                   # binary or huge: skip
-    text = data.decode("utf-8", errors="replace")
+        return []                                   # binary or enormous
     hits = []
-    for i, line in enumerate(text.splitlines(), 1):
+    for i, line in _iter_lines(data):
         for label, pat in SECRET_PATTERNS:
             if pat.search(line):
                 hits.append((i, label))
     return hits
+
+def _iter_lines(data: bytes):
+    # (line_no, text) without decoding the whole file at once, so a large
+    # text file costs a window rather than its own size again
+    lineno, start = 1, 0
+    n = len(data)
+    while start < n:
+        end = min(n, start + SCAN_WINDOW)
+        if end < n:                       # never split a line across windows
+            nl = data.rfind(b"\n", start, end)
+            end = nl + 1 if nl > start else end
+        chunk = data[start:end].decode("utf-8", errors="replace")
+        for line in chunk.splitlines():
+            yield lineno, line
+            lineno += 1
+        start = end
 
 REDACTED = "<REDACTED>"
 
@@ -627,7 +800,7 @@ def _report_hard_blocked(hard_blocked, what="save"):
               "--allow-secrets"))
     sys.exit(2)
 
-# trees
+# === trees ===
 _BAD_NAME = re.compile(r"^\.?\.?$")   # "", ".", ".."
 
 def safe_name(name: str) -> bool:
@@ -636,6 +809,11 @@ def safe_name(name: str) -> bool:
     return bool(name) and "/" not in name and "\\" not in name \
         and "\0" not in name and not _BAD_NAME.match(name) and name != SB_DIR
 
+SYMLINK_MODE = "120000"     # the blob holds the target path, not file bytes
+
+def is_link_mode(mode):
+    return mode == SYMLINK_MODE
+
 RACY_WINDOW_NS = 2_000_000_000   # files whose mtime OR ctime is < 2s old
                                  # bypass the stat cache and get reread
 
@@ -643,28 +821,64 @@ RACY_WINDOW_NS = 2_000_000_000   # files whose mtime OR ctime is < 2s old
 # restored mtime would slip past the cache. hash everything there instead
 _STATCACHE_TRUSTWORTHY = not sys.platform.startswith("win")
 
+def tracked_paths(repo):
+    # what the last save holds. an ignore rule never drops one of these:
+    # ignoring only decides what gets picked up, not what gets dropped
+    try:
+        tree, _ = head_tree_files(repo)
+        return set(tree)
+    except (KeyError, CorruptObject):
+        return set()
+
+def _tracked_dirs(tracked):
+    out = set()
+    for rel in tracked:
+        parts = rel.split("/")[:-1]
+        for i in range(len(parts)):
+            out.add("/".join(parts[:i + 1]))
+    return out
+
 def snapshot_worktree(repo: Repo, write=True, deep=False):
     # walk the working tree into {rel: (mode, blob_hash)}. write=True also
     # stores the blobs. the stat cache skips unchanged files unless deep is
     # set or the platform's ctime cannot be trusted
     use_cache = _STATCACHE_TRUSTWORTHY and not deep
     pats = load_ignores(repo.root)
+    tracked = tracked_paths(repo)
+    tdirs = _tracked_dirs(tracked)
     files, cache_updates, symlinks = {}, [], 0
     now_ns = time.time_ns()
     for dirpath, dirnames, filenames in os.walk(repo.root):
         rel_dir = os.path.relpath(dirpath, repo.root)
         rel_dir = "" if rel_dir == "." else rel_dir.replace(os.sep, "/")
-        dirnames[:] = sorted(d for d in dirnames
-                             if not is_ignored((rel_dir + "/" + d).lstrip("/"), pats))
+        linked_dirs = [d for d in dirnames
+                       if os.path.islink(os.path.join(dirpath, d))]
+        dirnames[:] = sorted(
+            d for d in dirnames
+            if d not in linked_dirs
+            and (lambda rd: not is_ignored(rd, pats) or rd in tdirs)
+                ((rel_dir + "/" + d).lstrip("/")))
+        for d in sorted(linked_dirs):       # a link to a directory is a link
+            rel = (rel_dir + "/" + d).lstrip("/")
+            if is_ignored(rel, pats) and rel not in tracked:
+                continue
+            target = os.readlink(os.path.join(dirpath, d)).encode()
+            h = repo.put("blob", target) if write else hash_obj("blob", target)
+            files[rel] = (SYMLINK_MODE, h)
         for fn in sorted(filenames):
             rel = (rel_dir + "/" + fn).lstrip("/")
-            if is_ignored(rel, pats):
+            if is_ignored(rel, pats) and rel not in tracked:
                 continue
             p = Path(dirpath) / fn
-            if p.is_symlink():
+            st = os.lstat(p)
+            if stat.S_ISLNK(st.st_mode):
+                target = os.readlink(p).encode()
+                h = repo.put("blob", target) if write else hash_obj("blob", target)
+                files[rel] = (SYMLINK_MODE, h)
                 symlinks += 1
                 continue
-            st = p.stat()
+            if not stat.S_ISREG(st.st_mode):
+                continue
             mode = "100755" if os.access(p, os.X_OK) else "100644"
             h = None
             if use_cache:
@@ -675,14 +889,18 @@ def snapshot_worktree(repo: Repo, write=True, deep=False):
             if h is not None and (not write or repo.has(h)):
                 files[rel] = (mode, h)
                 continue
-            data = p.read_bytes()
-            h = repo.put("blob", data) if write else hash_obj("blob", data)
+            if st.st_size >= CHUNK_THRESHOLD:
+                # h may hold a cached hash the store already has, in which
+                # case put_file returns without re-reading the file
+                h = (repo.put_file(p, st.st_size, known_hash=h) if write
+                     else hash_file(p, st.st_size))
+            else:
+                data = p.read_bytes()
+                h = repo.put("blob", data) if write else hash_obj("blob", data)
             files[rel] = (mode, h)
             cache_updates.append((rel, st.st_size, st.st_mtime_ns,
                                   st.st_ctime_ns, st.st_ino, h))
     repo.remember(cache_updates)
-    if symlinks and not write:      # the write pass repeats the walk; stay quiet
-        print(dim(f"note: {symlinks} symlink(s) skipped (not tracked)"))
     return files
 
 def build_tree(repo: Repo, files: dict) -> str:
@@ -726,7 +944,7 @@ def read_tree(repo: Repo, tree_hash: str, prefix="") -> dict:
             out[prefix + name] = (mode, h)
     return out
 
-# commits
+# === commits ===
 def make_commit(repo: Repo, tree_hash, parents, message) -> str:
     name, email = author()
     c = {"tree": tree_hash, "parents": list(parents), "author": name,
@@ -774,10 +992,83 @@ def worktree_vs_tree(work, tree):
 
 _EMPTY_BLOB = hash_obj("blob", b"")
 
-def detect_renames(new_files, old_files, added, deleted):
-    # pair each deleted path with an added one holding identical content.
-    # both sides are matched in sorted order, so this is deterministic, and
-    # empty files never pair since they would all match each other
+RENAME_SIMILARITY = 0.5     # share at least half your content to be a rename
+
+# Renaming is detected by hashes, in two layers. Identical content is an
+# exact hash match, which is free. A file that moved AND was edited has a
+# different hash by definition, so equality alone can never find it; what
+# does find it is hashing the file in PIECES and matching the pieces.
+#
+# The piece boundaries are chosen by content, not by offset: a rolling hash
+# over a 48 byte window cuts wherever the low bits hit a fixed pattern.
+# Inserting or deleting bytes then shifts only the piece it landed in,
+# leaving every other boundary where it was, so two versions of one file
+# still share nearly all their piece hashes. Fixed size blocks do not have
+# this property, since one inserted byte moves every later boundary and
+# changes every later hash.
+CDC_WINDOW = 48
+CDC_MIN = 512
+CDC_MAX = 16384
+CDC_MASK = 0x3FF            # about one cut every 1k on random data
+
+def _cdc_pieces(data: bytes):
+    # content defined boundaries via a rolling sum over the last window
+    n = len(data)
+    if n <= CDC_MIN:
+        yield data
+        return
+    start = 0
+    while start < n:
+        limit = min(start + CDC_MAX, n)
+        cut = limit
+        if limit - start > CDC_MIN:
+            roll = 0
+            scan = start + CDC_MIN
+            for i in range(max(start, scan - CDC_WINDOW), scan):
+                roll = ((roll << 1) + data[i]) & 0xFFFFFFFF
+            for i in range(scan, limit):
+                roll = ((roll << 1) + data[i]) & 0xFFFFFFFF
+                if i >= CDC_WINDOW:
+                    roll -= data[i - CDC_WINDOW] << CDC_WINDOW
+                    roll &= 0xFFFFFFFF
+                if (roll & CDC_MASK) == CDC_MASK:
+                    cut = i + 1
+                    break
+        yield data[start:cut]
+        start = cut
+
+def _shingles(repo, h, cache):
+    # the set of piece hashes for one object. text is split on lines, which
+    # are already content defined and cheaper; anything else uses the
+    # rolling hash so that inserted bytes do not shift every later piece
+    if h in cache:
+        return cache[h]
+    out = set()
+    try:
+        data = repo.get(h)[1]
+    except (KeyError, CorruptObject):
+        cache[h] = out
+        return out
+    if b"\0" in data[:8000]:
+        for piece in _cdc_pieces(data):
+            out.add(hashlib.blake2b(piece, digest_size=8).digest())
+    else:
+        for line in data.split(b"\n"):
+            line = line.strip()
+            if line:
+                out.add(hashlib.blake2b(line, digest_size=8).digest())
+    cache[h] = out
+    return out
+
+def _similarity(repo, ha, hb, cache):
+    a, b = _shingles(repo, ha, cache), _shingles(repo, hb, cache)
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+def detect_renames(new_files, old_files, added, deleted, repo=None):
+    # exact content pairs first, then content similarity for what is left, so
+    # a file that moved and was edited still reads as one rename
     by_hash = {}
     for p in sorted(deleted):
         h = old_files[p][1]
@@ -791,9 +1082,52 @@ def detect_renames(new_files, old_files, added, deleted):
         else:
             still_added.append(p)
     gone = {o for o, _ in renames}
-    return renames, still_added, [p for p in sorted(deleted) if p not in gone]
+    left_del = [p for p in sorted(deleted) if p not in gone]
+    if repo is not None and still_added and left_del:
+        renames += _similar_renames(repo, new_files, old_files,
+                                    still_added, left_del)
+        gone = {o for o, _ in renames}
+        taken = {n for _, n in renames}
+        still_added = [p for p in still_added if p not in taken]
+        left_del = [p for p in left_del if p not in gone]
+    return renames, still_added, left_del
 
-# checkout / cleanup
+def _similar_renames(repo, new_files, old_files, added, deleted):
+    # An inverted index from piece hash to the deleted paths holding it.
+    # Only paths that share at least one piece are ever compared, so this
+    # does not need a pair budget: unrelated files never meet, and the work
+    # is proportional to actual shared content rather than to added*deleted.
+    cache = {}
+    index = {}
+    for d in sorted(deleted):
+        dm, dh = old_files[d]
+        if is_link_mode(dm):
+            continue
+        for piece in _shingles(repo, dh, cache):
+            index.setdefault(piece, []).append(d)
+    scored = []
+    for a in sorted(added):
+        am, ah = new_files[a]
+        if is_link_mode(am):
+            continue
+        hits = {}
+        for piece in _shingles(repo, ah, cache):
+            for d in index.get(piece, ()):
+                hits[d] = hits.get(d, 0) + 1
+        for d in sorted(hits):
+            score = _similarity(repo, ah, old_files[d][1], cache)
+            if score >= RENAME_SIMILARITY:
+                scored.append((score, d, a))
+    scored.sort(key=lambda x: (-x[0], x[1], x[2]))
+    used_old, used_new, out = set(), set(), []
+    for _, d, a in scored:
+        if d in used_old or a in used_new:
+            continue
+        used_old.add(d); used_new.add(a)
+        out.append((d, a))
+    return sorted(out)
+
+# === checkout / cleanup ===
 def _safe_parent_fd(root_fd: int, rel: str):
     # open the parent of rel without following any symlinked component.
     # gives (parent_fd, leaf_name); the caller closes the fd. raises
@@ -847,8 +1181,7 @@ def _remove_at(dir_fd, name):
     st = _lstat_at(dir_fd, name)
     if st is None:
         return
-    import stat as _stat
-    if _stat.S_ISDIR(st.st_mode):
+    if stat.S_ISDIR(st.st_mode):
         sub = os.open(name, os.O_RDONLY | _O_NOFOLLOW | _O_DIRECTORY,
                       dir_fd=dir_fd)
         try:
@@ -874,13 +1207,56 @@ def _plan_checkout(target: dict, current: dict):
         key=lambda r: r.count("/"))
     return deletions, creations
 
+def _redaction_matches_target(repo, target, paths):
+    # paths whose file on disk redacts to exactly what the target holds.
+    # history stores <REDACTED>; the working file keeps the real value. a
+    # checkout must not "restore" the redacted form over it, or the only
+    # copy of a live credential is gone
+    out = set()
+    for p in paths:
+        entry = target.get(p)
+        if entry is None:
+            continue
+        try:
+            data = (repo.root / p).read_bytes()
+        except OSError:
+            continue
+        red, findings, safe = redact_secrets(data)
+        if findings and safe and hash_obj("blob", red) == entry[1]:
+            out.add(p)
+    return out
+
 def _checkout_preserving(repo, target, current, preserve):
     # checkout_tree, but never touching preserved paths: a lock holder's
     # version, or files an --ignore merge left alone
     preserve = set(preserve or ())
+    # a file that differs from the target only by redaction is already
+    # correct: rewriting it would destroy the secret it deliberately keeps
+    candidates = {p for p in target
+                  if p not in preserve and current.get(p) != target.get(p)}
+    keep = _redaction_matches_target(repo, target, candidates)
+    preserve |= keep
+    # what is left holds a secret on disk AND genuinely differs from the
+    # target, so the checkout is about to replace the only copy of it
+    losing = sorted(_paths_with_secrets(repo, candidates - keep))
+    if losing:
+        print(yellow("note: ") + dim("replacing file(s) whose working copy "
+              "holds a credential history never stored:"))
+        tree_print([cyan(p) for p in losing[:5]])
     t = {k: v for k, v in target.items() if k not in preserve}
     c = {k: v for k, v in current.items() if k not in preserve}
     checkout_tree(repo, t, c, preserve=preserve)
+
+def _paths_with_secrets(repo, paths):
+    out = set()
+    for p in paths:
+        try:
+            data = (repo.root / p).read_bytes()
+        except OSError:
+            continue
+        if scan_secrets(data):
+            out.add(p)
+    return out
 
 def checkout_tree(repo: Repo, target: dict, current: dict, preserve=None):
     # make the worktree equal target, in an order that survives files and
@@ -900,8 +1276,8 @@ def checkout_tree(repo: Repo, target: dict, current: dict, preserve=None):
                 pfd, leaf = _safe_parent_fd(root_fd, rel)
                 try:
                     st = _lstat_at(pfd, leaf)
-                    import stat as _stat
-                    if st is not None and _stat.S_ISREG(st.st_mode):
+                    if st is not None and (stat.S_ISREG(st.st_mode)
+                                           or stat.S_ISLNK(st.st_mode)):
                         continue          # already correct, leave it
                 finally:
                     os.close(pfd)
@@ -923,34 +1299,56 @@ def checkout_tree(repo: Repo, target: dict, current: dict, preserve=None):
             try:
                 st = _lstat_at(pfd, leaf)
                 if st is not None:
-                    import stat as _stat
-                    if (_stat.S_ISREG(st.st_mode)
-                            and current.get(rel) == (mode, h)):
-                        continue          # unchanged regular file, skip
-                    _remove_at(pfd, leaf)   # wrong shape/content: clear it
-                data = repo.get(h)[1]
-                _write_file_at(pfd, leaf, data,
-                               0o755 if mode == "100755" else 0o644)
+                    right_shape = (stat.S_ISLNK(st.st_mode) if is_link_mode(mode)
+                                   else stat.S_ISREG(st.st_mode))
+                    if right_shape and current.get(rel) == (mode, h):
+                        continue          # already what we want, leave it
+                    _remove_at(pfd, leaf)   # wrong shape or content
+                _materialize_entry(repo, pfd, leaf, mode, h)
             finally:
                 os.close(pfd)
         _prune_empty_dirs(repo)
     finally:
         os.close(root_fd)
 
+def _materialize_entry(repo, parent_fd, name, mode, h):
+    # the streaming form: a large file never becomes one bytes object
+    if is_link_mode(mode):
+        _write_symlink_at(parent_fd, name,
+                          repo.get(h)[1].decode("utf-8", "replace"))
+        return
+    _write_file_at(parent_fd, name, repo.stream(h),
+                   0o755 if mode == "100755" else 0o644)
+
+def _write_symlink_at(parent_fd: int, name: str, target: str):
+    # made under a random name and renamed in, so a half written link is
+    # never visible under the real one
+    tmpname = f".sb-{os.urandom(6).hex()}.tmp"
+    os.symlink(target, tmpname, dir_fd=parent_fd)
+    try:
+        os.replace(tmpname, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmpname, dir_fd=parent_fd)
+        raise
+    with contextlib.suppress(OSError):
+        os.fsync(parent_fd)
+
 def _write_file_at(parent_fd: int, name: str, data: bytes, perm: int):
     # create a randomized temp file with O_EXCL, write and fsync it, rename
     # it onto name, fsync the directory. the temp name is unpredictable, so
     # there is nothing to plant a symlink on
-    import stat as _stat
     tmpname = f".sb-{os.urandom(6).hex()}.tmp"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW
     fd = os.open(tmpname, flags, perm, dir_fd=parent_fd)
     try:
         # os.write may write fewer bytes than asked; loop until all land
-        view = memoryview(data)
-        off = 0
-        while off < len(view):
-            off += os.write(fd, view[off:])
+        pieces = (data,) if isinstance(data, (bytes, bytearray)) else data
+        for piece in pieces:
+            view = memoryview(piece)
+            off = 0
+            while off < len(view):
+                off += os.write(fd, view[off:])
         os.fchmod(fd, perm)
         os.fsync(fd)
     finally:
@@ -983,7 +1381,7 @@ def _prune_empty_dirs(repo: Repo):
         except OSError:
             pass
 
-# shared locking
+# === shared locking ===
 # a team shares one folder and one database. a lock protects content, not
 # permission:
 #
@@ -1048,7 +1446,7 @@ def _uid_identity(repo, uid):
         name = f"uid{uid}"
     return name, f"{name}@uid{uid}"
 
-def _restore_paths_on_disk(repo, targets):
+def _restore_paths_on_disk(repo, targets, locks=None):
     # write {rel: (mode, hash) or None} onto the worktree, None meaning
     # remove. same symlink safe writes as checkout
     root_fd = os.open(str(repo.root), os.O_RDONLY | _O_DIRECTORY)
@@ -1059,13 +1457,32 @@ def _restore_paths_on_disk(repo, targets):
                 _remove_at(pfd, leaf_name)
                 if mh is not None:
                     mode, h = mh
-                    _write_file_at(pfd, leaf_name, repo.get(h)[1],
-                                   0o755 if mode == "100755" else 0o644)
+                    _materialize_entry(repo, pfd, leaf_name, mode, h)
             finally:
                 os.close(pfd)
     finally:
         os.close(root_fd)
     _prune_empty_dirs(repo)
+
+def redaction_only_paths(repo, tree_files, work, paths):
+    # of `paths`, the ones whose only difference from the last save is that
+    # the save holds their secrets redacted. the working file is meant to
+    # differ, so these are not unsaved work and never count as dirty
+    return {p for p in paths
+            if _only_redaction_differs(repo, tree_files, work, p)}
+
+def _blob_contains(repo, h, needle: bytes):
+    # stream an object looking for a short marker, so this stays cheap and
+    # constant memory even when the object is a large chunked file
+    tail = b""
+    try:
+        for piece in repo.stream(h):
+            if needle in tail + piece:
+                return True
+            tail = piece[-len(needle):] if len(piece) >= len(needle) else piece
+    except (KeyError, CorruptObject):
+        return False
+    return False
 
 def _only_redaction_differs(repo, tree_files, work, p):
     # true when the file differs from the last save only because the save
@@ -1074,13 +1491,87 @@ def _only_redaction_differs(repo, tree_files, work, p):
     # so expiry skips the file and releases its lock
     if p not in work or p not in tree_files:
         return False
+    # cheapest tests first: this runs for every changed file on every
+    # command, so it must not read or scan a large file to say "no"
+    full = repo.root / p
     try:
-        data = (repo.root / p).read_bytes()
+        st = os.lstat(full)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_SCAN_BYTES:
+            return False
+        with open(full, "rb") as f:
+            if b"\0" in f.read(8000):
+                return False          # binary is never redacted
+    except OSError:
+        return False
+    # and only a saved copy holding the marker can be this case at all
+    if not _blob_contains(repo, tree_files[p][1], REDACTED.encode()):
+        return False
+    try:
+        data = full.read_bytes()
     except OSError:
         return False
     data2, findings, safe = redact_secrets(data)
     return (bool(findings) and safe
             and hash_obj("blob", data2) == tree_files[p][1])
+
+# a lock is enforced by the file system as well as by sb: while someone
+# holds one, the file keeps its owner's write bit and loses everyone
+# else's, so a second writer's editor refuses the write instead of
+# discovering the revert afterwards. sb still reverts, because a shared
+# login, a writable parent directory or root can get past the bits
+def _perm_bits(path):
+    try:
+        return os.lstat(path).st_mode & 0o7777
+    except OSError:
+        return None
+
+def _chmod_quiet(path, bits):
+    try:
+        if os.path.islink(path):
+            return False
+        if (os.lstat(path).st_mode & 0o7777) == bits:
+            return False              # already right: do not touch ctime
+        os.chmod(path, bits)
+        return True
+    except OSError:
+        return False
+
+def lock_perms_on(repo, rel, perm=None):
+    # drop group and other write, keep the holder's own
+    full = repo.root / rel
+    cur = _perm_bits(full)
+    if cur is None:
+        return perm if perm is not None else -1
+    orig = cur if perm is None or perm < 0 else perm
+    _chmod_quiet(full, cur & ~0o022)
+    return orig
+
+def lock_perms_off(repo, rel, perm):
+    # put back exactly what the file had before it was locked
+    full = repo.root / rel
+    cur = _perm_bits(full)
+    if cur is None:
+        return
+    if perm is not None and perm >= 0:
+        _chmod_quiet(full, perm)
+    else:
+        _chmod_quiet(full, cur | 0o200)
+
+def apply_lock_perms(repo, locks=None):
+    # idempotent: any command may have rewritten a locked file
+    for rel, l in (locks if locks is not None else repo.locks()).items():
+        lock_perms_on(repo, rel, l.get("perm", -1))
+
+def release_locks(repo, paths):
+    # restore permissions first, then drop the rows
+    paths = list(paths or ())
+    if not paths:
+        return
+    locks = repo.locks()
+    for rel in paths:
+        if rel in locks:
+            lock_perms_off(repo, rel, locks[rel].get("perm", -1))
+    repo.clear_locks(paths)
 
 def foreign_locks(repo):
     # paths locked by someone else. never overwritten by a checkout, never
@@ -1095,8 +1586,13 @@ def _disk_state(repo, rel):
         st = os.lstat(p)
     except OSError:
         return None, None, b"", None
-    import stat as _stat
-    if not _stat.S_ISREG(st.st_mode):
+    if stat.S_ISLNK(st.st_mode):
+        try:
+            data = os.readlink(p).encode()
+        except OSError:
+            return None, None, b"", st
+        return SYMLINK_MODE, hash_obj("blob", data), data, st
+    if not stat.S_ISREG(st.st_mode):
         return None, None, b"", st
     try:
         data = p.read_bytes()
@@ -1179,7 +1675,7 @@ def enforce_locks(repo, quiet=False):
         tree_print(rows)
         leaf(dim("recover your version any time: sb salvage <hash> [<path>]"))
     if release:
-        repo.clear_locks(release)
+        release_locks(repo, release)
     if advanced and not quiet:
         tree_print([f"lock on {cyan(p)} " + dim("follows your latest edit")
                     for p in sorted(advanced)])
@@ -1243,7 +1739,7 @@ def process_lock_expiry(repo):
             print(yellow("warning: ") + dim("that auto-save contains "
                   "recognizable secrets (kept verbatim so the revert loses "
                   "nothing): " + ", ".join(secretish[:4])))
-    repo.clear_locks([p for p, _ in expired])
+    release_locks(repo, [p for p, _ in expired])
     return committed
 
 def acquire_locks_for_edits(repo, quiet=False):
@@ -1263,6 +1759,7 @@ def acquire_locks_for_edits(repo, quiet=False):
     tree_files, _ = head_tree_files(repo)
     a, m, d = worktree_vs_tree(work, tree_files)
     edited = set(a) | set(m) | set(d)
+    edited -= redaction_only_paths(repo, tree_files, work, edited)
     locks = repo.locks()
     # unlocked edits, grouped by the file's owner on disk
     mine_new, theirs = [], {}
@@ -1286,7 +1783,8 @@ def acquire_locks_for_edits(repo, quiet=False):
                 mode, h = work.get(p, ("100644", None))
                 repo.set_lock(p, name, email, base, held=h or LOCK_DELETED,
                               mode=mode,
-                              uid=-1 if me_uid is None else me_uid)
+                              uid=-1 if me_uid is None else me_uid,
+                              perm=lock_perms_on(repo, p))
             if not quiet:
                 tree_print([f"locked {cyan(p)} " + dim("(your version wins "
                             "until you save)") for p in sorted(mine_new)])
@@ -1295,7 +1793,8 @@ def acquire_locks_for_edits(repo, quiet=False):
             for p in sorted(paths):
                 mode, h = work.get(p, ("100644", None))
                 repo.set_lock(p, o_name, o_email, base,
-                              held=h or LOCK_DELETED, mode=mode, uid=uid)
+                              held=h or LOCK_DELETED, mode=mode, uid=uid,
+                              perm=lock_perms_on(repo, p))
             if not quiet:
                 tree_print([f"locked {cyan(p)} to {bold(o_name)} "
                             + dim("(their on-disk edit)")
@@ -1307,6 +1806,7 @@ def sync_locks(repo, quiet=False):
     enforce_locks(repo, quiet=quiet)
     process_lock_expiry(repo)
     acquire_locks_for_edits(repo, quiet=quiet)
+    apply_lock_perms(repo)
 
 def _ago(ts):
     s = max(0, int(time.time()) - ts)
@@ -1316,7 +1816,7 @@ def _ago(ts):
 
 def _commit_subset(repo, work, tree_files, head_c, subset, message,
                    *, owner=None, email=None, op="save", extra=None,
-                   verify_drift=False, disk_ref=None):
+                   verify_drift=False, disk_ref=None, extra_parents=()):
     # commit a tree equal to the last one with only subset replaced by its
     # work version. this is how my save leaves everyone else's edits alone.
     #
@@ -1354,7 +1854,7 @@ def _commit_subset(repo, work, tree_files, head_c, subset, message,
                     + (" …" if len(drifted) > 5 else "")
                     + ")\n       nothing was saved — run 'sb save' again")
         tree_hash = build_tree(repo, merged)
-        parents = [head_c["hash"]] if head_c else []
+        parents = ([head_c["hash"]] if head_c else []) + list(extra_parents)
         if owner:
             c = {"tree": tree_hash, "parents": parents, "author": owner,
                  "email": email, "time": int(time.time()), "message": message}
@@ -1374,14 +1874,16 @@ def ensure_clean(repo, extra_exempt=None):
     work = snapshot_worktree(repo, write=False)
     tree, _ = head_tree_files(repo)
     a, m, d = worktree_vs_tree(work, tree)
-    dirty = sorted((set(a) | set(m) | set(d)) - exempt)
+    changed = (set(a) | set(m) | set(d)) - exempt
+    changed -= redaction_only_paths(repo, tree, work, changed)
+    dirty = sorted(changed)
     if dirty:
         die("you have unsaved changes — run 'sb save' first (nothing is ever\n"
             "       silently discarded), or 'sb undo -p <path>' to drop them\n"
             "       (" + ", ".join(dirty[:5])
             + (" …" if len(dirty) > 5 else "") + ")")
 
-# three way merge
+# === three way merge ===
 def _diff_regions(base, side):
     # changed regions of side against base, in base coordinates
     out = []
@@ -1411,10 +1913,16 @@ def merge3(base, ours, theirs):
     while ia < len(ca) or ib < len(cb):
         ra = ca[ia] if ia < len(ca) else None
         rb = cb[ib] if ib < len(cb) else None
-        if rb is None or (ra is not None and ra[1] < rb[0]):
+        both_insert_here = (ra is not None and rb is not None
+                            and ra[0] == ra[1] == rb[0] == rb[1])
+        if both_insert_here and ra[2] == rb[2]:
+            out.extend(base[pos:ra[0]]); out.extend(ra[2])
+            pos = ra[1]; ia += 1; ib += 1
+        elif not both_insert_here and (
+                rb is None or (ra is not None and ra[1] <= rb[0])):
             out.extend(base[pos:ra[0]]); out.extend(ra[2])
             pos = ra[1]; ia += 1
-        elif ra is None or rb[1] < ra[0]:
+        elif not both_insert_here and (ra is None or rb[1] <= ra[0]):
             out.extend(base[pos:rb[0]]); out.extend(rb[2])
             pos = rb[1]; ib += 1
         else:                                   # overlapping change group
@@ -1424,9 +1932,9 @@ def merge3(base, ours, theirs):
             grew = True
             while grew:
                 grew = False
-                while ia < len(ca) and ca[ia][0] <= e:
+                while ia < len(ca) and ca[ia][0] < e:
                     e = max(e, ca[ia][1]); ga.append(ca[ia]); ia += 1; grew = True
-                while ib < len(cb) and cb[ib][0] <= e:
+                while ib < len(cb) and cb[ib][0] < e:
                     e = max(e, cb[ib][1]); gb.append(cb[ib]); ib += 1; grew = True
             out.extend(base[pos:s])
             a_txt = _apply_regions(base, s, e, ga)
@@ -1444,33 +1952,45 @@ def merge3(base, ours, theirs):
     out.extend(base[pos:])
     return out, conflicts
 
-def _mergeable_lines(repo, h):
-    # lines that can be merged without changing bytes, or None if the file
-    # must not be merged at all. that means valid UTF-8, no NUL, LF endings
-    # only and a trailing newline, the shape join rebuilds exactly.
-    # everything else is reported as a conflict rather than rewritten
+def _rebuild_text(lines, eol, trailing):
+    out = eol.join(lines)
+    if trailing and lines:
+        out += eol
+    return out
+
+def text_form(repo, h):
+    # (lines, eol, trailing newline) for a file that can be merged by line,
+    # or None for one that cannot. CRLF and a missing final newline are kept
+    # as properties of the file rather than treated as reasons to refuse;
+    # only binary, invalid UTF-8 and mixed endings are out
     if h is None:
-        return []
+        return ([], "\n", True)
     data = repo.get(h)[1]
     if data == b"":
-        return []
-    if b"\0" in data or b"\r" in data:
-        return None
-    if not data.endswith(b"\n"):
+        return ([], "\n", True)
+    if b"\0" in data:
         return None
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
         return None
-    lines = text.split("\n")
-    if lines and lines[-1] == "":
-        lines.pop()                     # the trailing newline, not a line
+    crlf = text.count("\r\n")
+    if crlf and text.count("\n") != crlf:
+        return None                     # mixed endings: leave them alone
+    eol = "\r\n" if crlf else "\n"
+    norm = text.replace("\r\n", "\n")
+    if "\r" in norm:
+        return None                     # lone carriage returns
+    trailing = norm.endswith("\n")
+    lines = norm.split("\n")
+    if trailing:
+        lines.pop()
     # prove the rebuild is identical before relying on it
-    if ("\n".join(lines) + "\n").encode("utf-8") != data:
+    if _rebuild_text(lines, eol, trailing).encode("utf-8") != data:
         return None
-    return lines
+    return lines, eol, trailing
 
-# test gates
+# === test gates ===
 # scripts in sb-tests/<stage>/ are tracked files, so they travel with
 # branches. the stages gate saves, merges and releases.
 # they run in name order inside a clean temp checkout of the candidate tree,
@@ -1569,7 +2089,7 @@ print("[{name}] checking", os.environ["SB_BRANCH"], "@", os.environ["SB_COMMIT"]
 sys.exit(0)
 """
 
-# commands
+# === commands ===
 def cmd_init(args):
     root = Path(".").resolve()
     if (root / SB_DIR).exists():
@@ -1589,6 +2109,8 @@ def cmd_status(args):
                              deep=getattr(args, "deep", False))
     tree, _ = head_tree_files(repo)
     added, modified, deleted = worktree_vs_tree(work, tree)
+    redacted_only = redaction_only_paths(repo, tree, work, modified)
+    modified = [p for p in modified if p not in redacted_only]
     head = repo.head_commit()
     print(f"on branch {bold(repo.current_branch())}"
           + (f" {dim('·')} head {amber(short(head))}" if head
@@ -1606,10 +2128,15 @@ def cmd_status(args):
                         + ("" if mine else " · their version wins")))
         print(dim("locks:"))
         tree_print(rows)
+    if redacted_only:
+        print(dim("redacted in history (the working file keeps the real "
+                  "value):"))
+        tree_print([cyan(p) for p in sorted(redacted_only)])
     if not (added or modified or deleted):
         leaf("working tree clean " + dim("— nothing to save"))
         return
-    renames, added_r, deleted_r = detect_renames(work, tree, added, deleted)
+    renames, added_r, deleted_r = detect_renames(work, tree, added,
+                                                 deleted, repo)
     theirs = foreign_locks(repo)
     def mark(p):
         return p + (dim("  (theirs)") if p in theirs else "")
@@ -1671,19 +2198,26 @@ def cmd_save(args):
                 "and tested\n       (" + ", ".join(drifted[:5])
                 + (" …" if len(drifted) > 5 else "")
                 + ")\n       nothing was saved — run 'sb save' again")
+        theirs_tip, mstate = finish_merge_parents(repo, work)
         tree_hash = build_tree(repo, work)
-        parents = [head_c["hash"]] if head_c else []
+        parents = ([head_c["hash"]] if head_c else []) \
+            + ([theirs_tip] if theirs_tip else [])
         h = make_commit(repo, tree_hash, parents, args.message)
         bypass = {"global_force": True}
+        if mstate:
+            bypass["merged"] = mstate["branch"]
         if args.no_verify:    bypass["skipped_tests"] = True
         if args.allow_secrets: bypass["skipped_secret_scan"] = True
         if redacted:
             bypass["secrets_redacted"] = sorted(rel for rel, _ in redacted)
-        repo.update_ref(repo.current_branch(), h, op="save",
+        repo.update_ref(repo.current_branch(), h,
+                        op="merge" if mstate else "save",
                         expect=head_c["hash"] if head_c else None,
                         extra=bypass)
+        if mstate:
+            repo.set_meta(MERGE_STATE, "")
         # everyone's edits are in the commit, so no lock is left to protect
-        repo.clear_locks(list(repo.locks().keys()))
+        release_locks(repo, list(repo.locks().keys()))
     n = len(added) + len(modified) + len(deleted)
     print(f"{bold('saved')} {amber(short(h))} "
           f"{dim('on')} {bold(repo.current_branch())} {dim('·')} {dim(str(n) + ' file(s)')}")
@@ -1742,7 +2276,7 @@ def _save_shared(repo, args):
         if not changed:
             print(green("nothing new to save — the only changes were "
                         "redacted secrets already saved as <REDACTED>"))
-            repo.clear_locks(mine)
+            release_locks(repo, mine)
             return
         if not args.no_verify:
             candidate = dict(tree_files)
@@ -1759,13 +2293,20 @@ def _save_shared(repo, args):
         if args.allow_secrets: bypass["skipped_secret_scan"] = True
         if redacted:
             bypass["secrets_redacted"] = sorted(rel for rel, _ in redacted)
+        theirs_tip, mstate = finish_merge_parents(repo, work)
+        if mstate:
+            bypass["merged"] = mstate["branch"]
         # refuse if any of these changed on disk after the snapshot.
         # disk_ref is that snapshot, since work may hold redacted blobs
         h = _commit_subset(repo, work, tree_files, head_c, changed,
-                           args.message, owner=name, email=email, op="save",
+                           args.message, owner=name, email=email,
+                           op="merge" if mstate else "save",
                            extra=bypass or None,
-                           verify_drift=True, disk_ref=disk)
-        repo.clear_locks(changed)
+                           verify_drift=True, disk_ref=disk,
+                           extra_parents=[theirs_tip] if theirs_tip else ())
+        release_locks(repo, changed)
+        if mstate:
+            repo.set_meta(MERGE_STATE, "")
     print(f"{bold('saved')} {amber(short(h))} "
           f"{dim('on')} {bold(repo.current_branch())} {dim('·')} "
           f"{dim(str(len(changed)) + ' of your file(s)')}")
@@ -1794,7 +2335,7 @@ def cmd_log(args):
                      if c["parents"] else {})
             ctree = read_tree(repo, c["tree"])
             a, m, d = worktree_vs_tree(ctree, ptree)
-            rn, a, d = detect_renames(ctree, ptree, a, d)
+            rn, a, d = detect_renames(ctree, ptree, a, d, repo)
             bits = []
             if a: bits.append(f"+{len(a)} new")
             if m: bits.append(f"~{len(m)} modified")
@@ -1816,7 +2357,8 @@ def cmd_diff(args):
     tree, _ = head_tree_files(repo)
     work = snapshot_worktree(repo, write=False)
     added, modified, deleted = worktree_vs_tree(work, tree)
-    renames, added, deleted = detect_renames(work, tree, added, deleted)
+    renames, added, deleted = detect_renames(work, tree, added,
+                                             deleted, repo)
     targets = added + modified + deleted
     if args.path:
         want = args.path.rstrip("/")
@@ -1857,6 +2399,7 @@ def cmd_undo(args):
     # previous one, so undo again redoes. with -p, bring back one path from
     # the last save instead, overwriting the working copy and saving nothing
     repo = need_repo()
+    block_if_merging(repo, "undo")
     sync_locks(repo, quiet=True)
     keep = foreign_locks(repo)
     if args.path:                       # targeted: one path only
@@ -1883,14 +2426,13 @@ def cmd_undo(args):
                 except CheckoutConflict as e:
                     die(str(e))
                 try:
-                    _remove_at(pfd, fn)      # clear symlink/dir in the way
-                    _write_file_at(pfd, fn, repo.get(h)[1],
-                                   0o755 if mode == "100755" else 0o644)
+                    _remove_at(pfd, fn)      # clear whatever is in the way
+                    _materialize_entry(repo, pfd, fn, mode, h)
                 finally:
                     os.close(pfd)
         finally:
             os.close(root_fd)
-        repo.clear_locks(matches)       # the edit is gone: so is its lock
+        release_locks(repo, matches)    # the edit is gone: so is its lock
         what = cyan(rel) if len(matches) == 1 else \
             f"{len(matches)} file(s) under {rel}/"
         print(f"brought back {what} from the last save")
@@ -1988,6 +2530,7 @@ def cmd_restore(args):
     # a new save whose content equals a past state. like undo, but to any
     # point, and undo afterwards returns to where you were
     repo = need_repo()
+    block_if_merging(repo, "restore")
     sync_locks(repo, quiet=True)
     head = repo.head_commit()
     if not head:
@@ -2051,6 +2594,8 @@ def _create_branch(repo, branch, head, allow_secrets=False):
 
 def cmd_branch(args):
     repo = need_repo()
+    if args.name and not args.remove:
+        block_if_merging(repo, "branch")
     if not args.name:
         cur = repo.current_branch()
         branches = repo.branches()
@@ -2095,6 +2640,7 @@ def cmd_branch(args):
 
 def cmd_switch(args):
     repo = need_repo()
+    block_if_merging(repo, "switch")
     if args.target not in repo.branches():
         die(f"no branch named '{args.target}' "
             f"(sandbox has no detached mode; create it first: sb branch {args.target})")
@@ -2157,8 +2703,138 @@ def find_merge_base(repo, a, b):
         return (c["time"], h)
     return sorted(lcas, key=key)[-1]
 
+MERGE_STATE = "merge"       # meta key holding an unfinished merge
+CONFLICT_MARK = "<<<<<<< ours"
+
+def merge_state(repo):
+    raw = repo.meta(MERGE_STATE)
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return None
+
+def block_if_merging(repo, what):
+    st = merge_state(repo)
+    if st:
+        die(f"a merge of '{st['branch']}' is still open — finish it with "
+            f"'sb save \"<message>\"'\n       or drop it with 'sb merge --abort', "
+            f"then {what}")
+
+def _begin_conflicted_merge(repo, args, merged, marked, conflicts, ours_tree,
+                            ours_tip, theirs_tip, preserve, skip):
+    # put the merge in the worktree with markers in the conflicting files,
+    # so they can be resolved where they are read. nothing is committed:
+    # 'sb save' finishes the merge, 'sb merge --abort' drops it
+    target = dict(merged)
+    for rel, h in marked.items():
+        mode = (merged.get(rel) or ours_tree.get(rel) or ("100644", h))[0]
+        if is_link_mode(mode):
+            continue          # markers cannot live inside a link target
+        target[rel] = (mode, h)
+    _checkout_preserving(repo, target, ours_tree, preserve)
+    repo.set_meta(MERGE_STATE, json.dumps({
+        "branch": args.branch, "ours": ours_tip, "theirs": theirs_tip,
+        "conflicts": sorted(rel for rel, _ in conflicts),
+        "marked": sorted(marked),
+        "skip": sorted(skip)}))
+    repo.journal("merge-open", {"branch": args.branch, "theirs": theirs_tip,
+                                "conflicts": sorted(r for r, _ in conflicts)})
+    print(red(f"merge of {args.branch}: {len(conflicts)} file(s) need you"))
+    tree_print([red(rel) + dim(f"  ({why})") for rel, why in conflicts])
+    marked_n = len(marked)
+    if marked_n:
+        leaf(dim(f"{marked_n} of them now hold ours/theirs markers in the "
+                 "file itself"))
+    unmarked = [r for r, _ in conflicts if r not in marked]
+    if unmarked:
+        leaf(dim("kept at your version (nothing to mark up): "
+                 + ", ".join(unmarked[:4])))
+    print(dim("edit them, then 'sb save \"<message>\"' to finish the merge\n"
+              "or 'sb merge --abort' to put the folder back"))
+
+def _abort_merge(repo):
+    st = merge_state(repo)
+    if not st:
+        die("no merge is open")
+    ours_tree = read_tree(repo, parse_commit(repo, st["ours"])["tree"])
+    work = snapshot_worktree(repo, write=False)
+    _checkout_preserving(repo, ours_tree, work, foreign_locks(repo))
+    release_locks(repo, [p for p in st["conflicts"] if p in repo.locks()])
+    repo.set_meta(MERGE_STATE, "")
+    repo.journal("merge-abort", {"branch": st["branch"]})
+    print(f"{bold('merge aborted')} {dim('· folder is back at')} "
+          f"{amber(short(st['ours']))}")
+
+def finish_merge_parents(repo, work):
+    # a save while a merge is open completes it: the commit gets both
+    # parents, and any file still holding markers stops the save
+    st = merge_state(repo)
+    if not st:
+        return None, None
+    left = []
+    for rel in st["conflicts"]:
+        h = (work.get(rel) or (None, None))[1]
+        if h is None:
+            continue
+        try:
+            data = repo.get(h)[1]
+        except (KeyError, CorruptObject):
+            continue
+        if CONFLICT_MARK.encode() in data:
+            left.append(rel)
+    if left:
+        die("conflict markers are still in " + ", ".join(left[:4])
+            + (" …" if len(left) > 4 else "")
+            + "\n       resolve them and save again, or 'sb merge --abort'")
+    return st["theirs"], st
+
+def _tree_renames(repo, base_tree, side_tree):
+    # what one side renamed, relative to the base
+    added = [p for p in side_tree if p not in base_tree]
+    deleted = [p for p in base_tree if p not in side_tree]
+    if not added or not deleted:
+        return []
+    ren, _, _ = detect_renames(side_tree, base_tree, added, deleted, repo)
+    return ren
+
+def _merge_entry(repo, b, o, t):
+    # decide one path. gives (kind, entry, why, marked_blob) where kind is
+    # take or conflict, and marked_blob holds the marked up text when the
+    # conflict is one a person can resolve in the file itself
+    if o == t:              return "take", o, "same", None
+    if t == b:              return "take", o, "ours", None
+    if o == b:              return "take", t, "theirs", None
+    if o is None or t is None:
+        return "conflict", None, "changed on one side, deleted on the other", None
+    if o[0] != t[0]:
+        return "conflict", None, "executable bit differs", None
+    if is_link_mode(o[0]):
+        # a link target is one path, not lines. merging it by line could
+        # build a target that points nowhere, so differing targets are a
+        # conflict, and there is nothing to mark up inside a link
+        return "conflict", None, "both point somewhere different now", None
+    bf = text_form(repo, b[1] if b else None)
+    of = text_form(repo, o[1])
+    tf = text_form(repo, t[1])
+    if bf is None or of is None or tf is None:
+        return "conflict", None, "binary: no line by line merge", None
+    lines, n = merge3(bf[0], of[0], tf[0])
+    data = _rebuild_text(lines, of[1], of[2]).encode("utf-8")
+    if n:
+        return ("conflict", None, f"{n} overlapping change(s)",
+                repo.put("blob", data))
+    return "take", (o[0], repo.put("blob", data)), "auto", None
+
 def cmd_merge(args):
     repo = need_repo()
+    if getattr(args, "abort", False):
+        _abort_merge(repo)
+        return
+    block_if_merging(repo, "merge again")
+    if not args.branch:
+        die("which branch? usage: sb merge <branch> [--no-verify] [-i]")
     sync_locks(repo, quiet=True)
     theirs_tip = repo.resolve(args.branch)
     if theirs_tip is None:
@@ -2215,43 +2891,77 @@ def cmd_merge(args):
         print(green("already contains that branch")); return
     base_tree = read_tree(repo, parse_commit(repo, base)["tree"]) if base else {}
     merged, conflicts, auto_merged = {}, [], []
+    marked = {}                 # path to the blob holding conflict markers
+    ours_ren = dict(_tree_renames(repo, base_tree, ours_tree))
+    theirs_ren = dict(_tree_renames(repo, base_tree, theirs_tree))
+    handled, follow = set(), []
+    # A renamed file keeps its identity: the merge is done against the
+    # content it had under its OLD name, then recorded under the new one.
+    # Without this the new path has no entry in the base, so a three way
+    # merge would run with an empty base and conflict on the whole file
+    # even when the two sides edited different lines.
+    for old, new in sorted(ours_ren.items()):
+        theirs_new = theirs_ren.get(old)
+        if theirs_new is not None:
+            if theirs_new != new:
+                conflicts.append((old, f"renamed to {new} here and to "
+                                       f"{theirs_new} there"))
+                handled |= {old, new, theirs_new}
+            else:                     # same rename on both sides
+                follow.append((new, base_tree.get(old), ours_tree.get(new),
+                               theirs_tree.get(new), old))
+                handled |= {old, new}
+            continue
+        if old in theirs_tree:            # they kept editing the old name
+            follow.append((new, base_tree.get(old), ours_tree.get(new),
+                           theirs_tree.get(old), old))
+            handled |= {old, new}
+        else:                             # they deleted what we renamed
+            conflicts.append((new, f"renamed from {old} here, deleted there"))
+            handled |= {old, new}
+    for old, new in sorted(theirs_ren.items()):
+        if old in ours_ren or old in handled:
+            continue
+        if old in ours_tree:
+            follow.append((new, base_tree.get(old), ours_tree.get(old),
+                           theirs_tree.get(new), old))
+            handled |= {old, new}
+        else:                             # we deleted what they renamed
+            conflicts.append((new, f"renamed from {old} there, deleted here"))
+            handled |= {old, new}
     for rel in sorted(set(base_tree) | set(ours_tree) | set(theirs_tree)):
         if rel in skip:
             merged[rel] = ours_tree.get(rel)   # keep our version, don't touch
             continue
-        b = base_tree.get(rel); o = ours_tree.get(rel); t = theirs_tree.get(rel)
-        if o == t:                        merged[rel] = o
-        elif t == b:                      merged[rel] = o     # only we changed
-        elif o == b:                      merged[rel] = t     # only they changed
-        elif o is None or t is None:      conflicts.append((rel, "changed vs deleted"))
+        if rel in handled:
+            continue
+        kind, entry, why, mark = _merge_entry(
+            repo, base_tree.get(rel), ours_tree.get(rel), theirs_tree.get(rel))
+        if kind == "take":
+            merged[rel] = entry
+            if why == "auto":
+                auto_merged.append(rel)
         else:
-            # both sides changed it, so merge by line, but only when every
-            # side rebuilds exactly
-            bl = _mergeable_lines(repo, b[1] if b else None)
-            ol = _mergeable_lines(repo, o[1])
-            tl = _mergeable_lines(repo, t[1])
-            if bl is None or ol is None or tl is None:
-                conflicts.append((rel, "not safely auto-mergeable "
-                                       "(binary, CRLF, or no trailing newline)"))
-                continue
-            if o[0] != t[0]:              # same content path, different mode
-                conflicts.append((rel, "executable bit differs"))
-                continue
-            lines, n = merge3(bl, ol, tl)
-            if n:
-                conflicts.append((rel, f"{n} overlapping change(s)"))
-                continue
-            merged[rel] = (o[0], repo.put("blob",
-                           ("\n".join(lines) + "\n").encode()))
-            auto_merged.append(rel)
-    if conflicts:
-        print(red("merge stopped — these files conflict"))
-        tree_print([red(rel) + dim(f"  ({why})") for rel, why in conflicts])
-        print(dim("sb never half-merges your worktree: reconcile the files on\n"
-                  "one branch (copy the other side's version or combine them\n"
-                  "by hand), save, then merge again"))
-        sys.exit(2)
+            conflicts.append((rel, why))
+            merged[rel] = ours_tree.get(rel)
+            if mark is not None:
+                marked[rel] = mark
+    for new, b, o, t, old in follow:      # a rename with an edit behind it
+        kind, entry, why, mark = _merge_entry(repo, b, o, t)
+        if kind == "take":
+            merged[new] = entry
+            auto_merged.append(f"{old} → {new}")
+        else:
+            conflicts.append((new, f"{why} (renamed from {old})"))
+            merged[new] = o
+            if mark is not None:
+                marked[new] = mark
+        merged.pop(old, None)
     merged = {k: v for k, v in merged.items() if v is not None}
+    if conflicts:
+        _begin_conflicted_merge(repo, args, merged, marked, conflicts,
+                                ours_tree, ours_tip, theirs_tip, preserve, skip)
+        sys.exit(2)
     if not args.no_verify:
         if not run_stage(repo, "pre-merge", merged,
                          commit=f"merge({short(ours_tip)},{short(theirs_tip)})"):
@@ -2371,6 +3081,7 @@ def cmd_publish(args):
     if args.label == "list":               # word form of -l, like 'sb test list'
         args.list, args.label = True, None
     repo = need_repo()
+    block_if_merging(repo, "publish")
     if args.list:
         recs = [e for e in repo.journal_entries()
                 if e["op"] in ("publish", "deploy")]
@@ -2456,7 +3167,7 @@ def _verify(repo, quiet=False, anchor=None):
                 seen_blobs.add(h)
                 objects += 1
                 try:
-                    repo.get(h)
+                    repo.verify_object(h)
                 except KeyError:
                     flag("object", f"missing blob {short(h)} ({name})")
                 except CorruptObject as e:
@@ -2508,7 +3219,7 @@ def _verify(repo, quiet=False, anchor=None):
             check_tree(h)
             continue
         try:
-            repo.get(h)
+            repo.verify_object(h)
         except CorruptObject as e:
             flag("object", str(e))
 
@@ -2758,7 +3469,7 @@ def cmd_unlock(args):
     if freed:
         with repo.transaction():        # release + journal: one transaction
             owners = sorted({locks[p]["owner"] for p in freed})
-            repo.clear_locks(freed)
+            release_locks(repo, freed)
             repo.journal("unlock", {"paths": sorted(freed), "forced": force,
                                     "owners": owners, "by": name})
     if freed:
@@ -2832,477 +3543,7 @@ def cmd_ignore(args):
     print(f"ignoring {cyan(args.pattern)}")
     leaf(dim(".sbignore updated"))
 
-def cmd_selftest(args):
-    # adversarial self test: crash injection at the ref and journal
-    # boundary, symlink escapes, files swapping with directories, mutation
-    # during a gate, merge fidelity, racing saves, store verification,
-    # archive salt, branch bootstrapping and the content lock model.
-    # exits 0 when everything passes
-    import shutil as _sh, threading as _th, io as _io, tarfile as _tar
-    import sqlite3 as _sql, zlib as _zl
-    SELF = str(Path(__file__).resolve())
-    passed, failed = [], []
-
-    def check(name, cond):
-        (passed if cond else failed).append(name)
-        print(("  " + amber("\u2514\u2500\u2500\u2500 ") if False else "  ")
-              + (green("ok  ") if cond else red("FAIL")) + "  " + name)
-
-    def run(*a, cwd=None, expect=None):
-        r = subprocess.run([sys.executable, SELF, *a], cwd=cwd,
-                           capture_output=True, text=True)
-        if expect is not None and r.returncode != expect:
-            raise AssertionError(f"{a} -> {r.returncode}\n{r.stdout}{r.stderr}")
-        return r
-
-    def fresh():
-        d = Path(tempfile.mkdtemp(prefix="sbtest-"))
-        return d, os.getcwd()
-
-    cases = []
-    def case(fn):
-        cases.append(fn); return fn
-
-    @case
-    def atomic_ref_journal():
-        d, old = fresh(); os.chdir(d)
-        try:
-            run("init"); Path("f").write_text("1"); run("save", "one")
-            repo = Repo(Path(".").resolve())
-            tip0 = repo.tip("main")
-            n0 = repo.db.execute("SELECT COUNT(*) FROM journal").fetchone()[0]
-            orig = Repo.journal
-            def boom(self, op, detail): raise RuntimeError("crash")
-            Repo.journal = boom
-            try: repo.update_ref("main", "ab" * 32, op="save")
-            except RuntimeError: pass
-            finally: Repo.journal = orig
-            ok = (repo.tip("main") == tip0
-                  and repo.db.execute("SELECT COUNT(*) FROM journal")
-                          .fetchone()[0] == n0)
-            check("atomic: ref rolls back with failed journal", ok)
-            check("atomic: verify clean after rollback",
-                  run("verify").returncode == 0)
-        finally:
-            os.chdir(old); _sh.rmtree(d, ignore_errors=True)
-
-    @case
-    def symlink_escape():
-        d, old = fresh(); os.chdir(d)
-        outside = Path(tempfile.mkdtemp(prefix="outside-"))
-        try:
-            run("init"); Path("seed").write_text("s"); run("save", "s")
-            os.mkdir("realdir"); Path("realdir/victim").write_text("v")
-            run("save", "add victim")
-            repo = Repo(Path(".").resolve())
-            tree, _ = head_tree_files(repo)
-            _sh.rmtree("realdir"); os.symlink(str(outside), "realdir")
-            try: checkout_tree(repo, tree, {})
-            except CheckoutConflict: pass
-            check("path: symlinked parent cannot redirect checkout",
-                  not (outside / "victim").exists())
-        finally:
-            os.chdir(old); _sh.rmtree(d, ignore_errors=True)
-            _sh.rmtree(outside, ignore_errors=True)
-
-    @case
-    def file_dir_transition():
-        d, old = fresh(); os.chdir(d)
-        try:
-            run("init"); os.mkdir("a"); Path("a/b").write_text("in")
-            run("save", "dir")
-            run("branch", "other"); run("switch", "other")
-            _sh.rmtree("a"); Path("a").write_text("file"); run("save", "file")
-            r1 = run("switch", "main"); r2 = run("switch", "other")
-            check("path: file<->dir transition works",
-                  r1.returncode == 0 and r2.returncode == 0)
-        finally:
-            os.chdir(old); _sh.rmtree(d, ignore_errors=True)
-
-    @case
-    def untar_symlink_safe():
-        d, old = fresh(); os.chdir(d)
-        outside = Path(tempfile.mkdtemp(prefix="outside-"))
-        try:
-            dest = Path("dest"); dest.mkdir()
-            os.symlink(str(outside), str(dest / "sub"))
-            buf = _io.BytesIO()
-            with _tar.open(fileobj=buf, mode="w") as t:
-                info = _tar.TarInfo("sub/evil"); data = b"pwned"
-                info.size = len(data); t.addfile(info, _io.BytesIO(data))
-            blocked = False
-            try: _untar_files(buf.getvalue(), dest)
-            except (CheckoutConflict, SystemExit): blocked = True
-            check("path: untar refuses symlinked parent",
-                  blocked and not (outside / "evil").exists())
-        finally:
-            os.chdir(old); _sh.rmtree(d, ignore_errors=True)
-            _sh.rmtree(outside, ignore_errors=True)
-
-    @case
-    def save_consistency():
-        d, old = fresh(); os.chdir(d)
-        try:
-            run("init"); Path("app.py").write_text("x=1"); run("save", "first")
-            run("test", "new", "pre-save", "m.py")
-            Path("sb-tests/pre-save/m.py").write_text(
-                'import os,sys\n'
-                'open(os.path.join(os.environ["SB_REPO"],"app.py"),"w")'
-                '.write("M\\n")\nsys.exit(0)\n')
-            Path("app.py").write_text("x=2")
-            r = run("save", "block")
-            check("consistency: mid-gate mutation blocks save",
-                  "changed while" in (r.stdout + r.stderr)
-                  and "first" in run("log", "-n", "1").stdout)
-        finally:
-            os.chdir(old); _sh.rmtree(d, ignore_errors=True)
-
-    @case
-    def branch_starts_saved():
-        d, old = fresh(); os.chdir(d)
-        try:
-            run("init")
-            Path("a.txt").write_text("hello\n")      # never saved by hand
-            r = run("branch", "feat")
-            seeded = "Initial branch creation" in run("log").stdout
-            run("switch", "feat", expect=0)          # no save needed first
-            clean = "clean" in run("status").stdout
-            Path("b.txt").write_text("new\n")
-            run("save", "work on feat")
-            run("switch", "main", expect=0)
-            m = run("merge", "feat")
-            check("branch: a new branch saves the folder immediately",
-                  r.returncode == 0 and seeded and clean)
-            check("branch: mergeable at once, with no manual first save",
-                  m.returncode == 0 and Path("b.txt").exists()
-                  and Path("a.txt").read_text() == "hello\n")
-        finally:
-            os.chdir(old); _sh.rmtree(d, ignore_errors=True)
-
-    @case
-    def branch_captures_unsaved_work():
-        d, old = fresh(); os.chdir(d)
-        try:
-            run("init"); Path("a").write_text("1"); run("save", "a")
-            Path("b").write_text("2")                # unsaved when branching
-            run("branch", "feat", expect=0)
-            run("switch", "feat", expect=0)
-            check("branch: unsaved work goes into the initial save",
-                  "clean" in run("status").stdout and Path("b").exists())
-        finally:
-            os.chdir(old); _sh.rmtree(d, ignore_errors=True)
-
-    @case
-    def merge_keeps_our_only_file():
-        d, old = fresh(); os.chdir(d)
-        try:
-            run("init"); Path("seed").write_text("s"); run("save", "s")
-            run("branch", "feat")
-            Path("mine.txt").write_text("mine\n"); run("save", "only on main")
-            r = run("merge", "feat")
-            check("merge: a file only our side has is kept, not deleted",
-                  r.returncode == 0 and Path("mine.txt").exists())
-        finally:
-            os.chdir(old); _sh.rmtree(d, ignore_errors=True)
-
-    @case
-    def merge_crlf_conflicts():
-        d, old = fresh(); os.chdir(d)
-        try:
-            run("init"); Path("seed").write_text("s"); run("save", "s")
-            Path("w.txt").write_bytes(b"a\r\nb\r\nc\r\n"); run("save", "base")
-            run("branch", "x"); run("switch", "x")
-            Path("w.txt").write_bytes(b"a\r\nB\r\nc\r\n"); run("save", "x")
-            run("switch", "main")
-            Path("w.txt").write_bytes(b"A\r\nb\r\nc\r\n"); run("save", "m")
-            check("merge: CRLF conflicts instead of silent rewrite",
-                  run("merge", "x").returncode == 2)
-        finally:
-            os.chdir(old); _sh.rmtree(d, ignore_errors=True)
-
-    @case
-    def merge_addadd():
-        d, old = fresh(); os.chdir(d)
-        try:
-            run("init"); Path("seed").write_text("s"); run("save", "s")
-            run("branch", "b1"); run("switch", "b1")
-            Path("f").write_text(""); run("save", "empty")
-            run("switch", "main"); run("branch", "b2"); run("switch", "b2")
-            Path("f").write_text("hi\n"); run("save", "nonempty")
-            run("switch", "main"); run("merge", "b1")
-            r = run("merge", "b2")
-            check("merge: add/add does not crash",
-                  "Traceback" not in (r.stdout + r.stderr))
-        finally:
-            os.chdir(old); _sh.rmtree(d, ignore_errors=True)
-
-    @case
-    def cas_lost_update():
-        d, old = fresh(); os.chdir(d)
-        try:
-            run("init"); Path("f").write_text("1"); run("save", "one")
-            repo = Repo(Path(".").resolve())
-            Path("f").write_text("2"); run("save", "two")
-            aborted = False
-            try:
-                repo.update_ref("main", "cd" * 32, op="save", expect="00" * 32)
-            except SystemExit:
-                aborted = True
-            check("concurrency: stale ref update aborts (CAS)", aborted)
-        finally:
-            os.chdir(old); _sh.rmtree(d, ignore_errors=True)
-
-    @case
-    def concurrent_saves():
-        d, old = fresh(); os.chdir(d)
-        try:
-            run("init"); Path("f0").write_text("0"); run("save", "base")
-            def w(i):
-                Path(f"f{i}").write_text(str(i)); run("save", f"s{i}")
-            ts = [_th.Thread(target=w, args=(i,)) for i in range(1, 6)]
-            for t in ts: t.start()
-            for t in ts: t.join()
-            check("concurrency: parallel saves keep store valid",
-                  run("verify").returncode == 0)
-        finally:
-            os.chdir(old); _sh.rmtree(d, ignore_errors=True)
-
-    @case
-    def verify_full_store():
-        d, old = fresh(); os.chdir(d)
-        try:
-            run("init"); Path("seed").write_text("s"); run("save", "s")
-            run("branch", "tmp"); run("switch", "tmp")
-            Path("only.txt").write_text("tmp-only\n"); run("save", "on tmp")
-            run("switch", "main"); run("branch", "tmp", "-r")
-            target = hash_obj("blob", b"tmp-only\n")
-            db = _sql.connect(".sb/sandbox.db")
-            db.execute("UPDATE objects SET data=? WHERE hash=?",
-                       (_zl.compress(b"CORRUPT"), target))
-            db.commit(); db.close()
-            r = run("verify")
-            check("verify: corruption in removed-branch history is caught",
-                  r.returncode == 2 and ("CORRUPTION" in r.stdout
-                                         or "does not match" in r.stdout))
-        finally:
-            os.chdir(old); _sh.rmtree(d, ignore_errors=True)
-
-    @case
-    def archive_salt_unique():
-        d, old = fresh(); os.chdir(d)
-        try:
-            run("init"); Path("f").write_text("secret"); run("save", "s")
-            run("pack", "a.sbox", "-k", "pw"); run("pack", "b.sbox", "-k", "pw")
-            a = Path("a.sbox").read_bytes(); b = Path("b.sbox").read_bytes()
-            check("crypto: per-archive salt differs",
-                  a[4] >= 2 and a[5:21] != b[5:21] and a[21:80] != b[21:80])
-            run("unpack", "a.sbox", "out", "-k", "pw", expect=0)
-            check("crypto: salted archive round-trips",
-                  Path("out/f").read_text() == "secret")
-        finally:
-            os.chdir(old); _sh.rmtree(d, ignore_errors=True)
-
-    @case
-    def restored_mtime():
-        if sys.platform.startswith("win"):
-            check("statcache: restored-mtime edit (skipped on win)", True); return
-        d, old = fresh(); os.chdir(d)
-        try:
-            run("init"); p = Path("s.txt"); p.write_text("aaaa\n")
-            past = time.time() - 864000; os.utime(p, (past, past))
-            run("save", "base"); run("status")
-            p.write_text("bbbb\n"); os.utime(p, (past, past))
-            r = run("status")
-            check("statcache: restored-mtime edit detected",
-                  "modified" in r.stdout and "s.txt" in r.stdout)
-        finally:
-            os.chdir(old); _sh.rmtree(d, ignore_errors=True)
-
-    @case
-    def secret_redaction():
-        d, old = fresh(); os.chdir(d)
-        xd = Path(tempfile.mkdtemp(prefix="sbexp-"))
-        try:
-            run("init"); Path("seed").write_text("s"); run("save", "seed")
-            fake = "AKIA" + "A" * 16
-            Path("cfg.py").write_text(f'key = "{fake}"\nx = 1\n')
-            r = run("save", "with secret")
-            saved = r.returncode == 0
-            run("export", "main", str(xd / "chk"))
-            exported = (xd / "chk/cfg.py").read_text()
-            check("secrets: save proceeds with the secret redacted",
-                  saved and "<REDACTED>" in exported and fake not in exported
-                  and "x = 1" in exported)
-            check("secrets: the working file is never rewritten",
-                  fake in Path("cfg.py").read_text())
-            r2 = run("save", "again")
-            check("secrets: an unchanged redacted file doesn't loop",
-                  "nothing" in (r2.stdout + r2.stderr))
-            # a private key block is redacted in full, not just its header
-            body = ("-----BEGIN RSA PRIVATE KEY-----\n"
-                    "MIIEowIBAAKCAQEAsecretsecretsecret\n"
-                    "-----END RSA PRIVATE KEY-----\n")
-            Path("id_rsa").write_text(body)
-            run("save", "key")
-            run("export", "main", str(xd / "chk2"))
-            exp = (xd / "chk2/id_rsa").read_text()
-            check("secrets: private key blocks are redacted whole",
-                  "MIIEow" not in exp and "<REDACTED>" in exp)
-            # --allow-secrets stores the bytes verbatim, journaled
-            Path("cfg2.py").write_text(f'k2 = "{fake}"\n')
-            run("save", "verbatim", "--allow-secrets")
-            run("export", "main", str(xd / "chk3"))
-            check("secrets: --allow-secrets saves verbatim",
-                  fake in (xd / "chk3/cfg2.py").read_text())
-        finally:
-            os.chdir(old); _sh.rmtree(d, ignore_errors=True)
-            _sh.rmtree(xd, ignore_errors=True)
-
-    @case
-    def lock_content_wins():
-        # a locked file is its holder's version. anyone can type into it,
-        # but the next command puts it back and keeps their bytes
-        d, old = fresh(); os.chdir(d)
-        xd = Path(tempfile.mkdtemp(prefix="sbexp-"))
-        env0 = dict(os.environ)
-        def as_user(n, e, *a, **k):
-            os.environ["SB_NAME"] = n; os.environ["SB_EMAIL"] = e
-            return run(*a, **k)
-        try:
-            as_user("Lead", "l@co", "init")
-            Path("f.txt").write_text("v1\n")
-            as_user("Lead", "l@co", "save", "seed")
-            Path("f.txt").write_text("alice\n")
-            as_user("Alice", "a@co", "status")          # alice takes the lock
-            Path("f.txt").write_text("bob\n")           # bob types over it
-            r = as_user("Bob", "b@co", "status")
-            check("locks: a foreign edit is put back to the holder's version",
-                  Path("f.txt").read_text() == "alice\n")
-            m = re.search(r"kept as ([0-9a-f]{6,})", r.stdout)
-            check("locks: the overwritten bytes are stored, not destroyed",
-                  m is not None)
-            if m:
-                as_user("Bob", "b@co", "salvage", m.group(1),
-                        str(xd / "bobs.txt"), expect=0)
-                check("locks: sb salvage brings the rejected version back",
-                      (xd / "bobs.txt").read_text() == "bob\n")
-            as_user("Bob", "b@co", "save", "try to take it")
-            as_user("Lead", "l@co", "export", "main", str(xd / "chk1"))
-            check("locks: nobody but the holder can save a locked file",
-                  (xd / "chk1/f.txt").read_text() == "v1\n")
-            Path("f.txt").write_text("alice2\n")        # holder edits again
-            as_user("Alice", "a@co", "status")
-            Path("f.txt").write_text("bob2\n")
-            as_user("Bob", "b@co", "status")
-            check("locks: the protected version follows the holder's edits",
-                  Path("f.txt").read_text() == "alice2\n")
-            as_user("Alice", "a@co", "save", "alice's work")
-            as_user("Lead", "l@co", "export", "main", str(xd / "chk2"))
-            check("locks: the holder's save lands and frees the file",
-                  (xd / "chk2/f.txt").read_text() == "alice2\n"
-                  and not Repo(Path(".").resolve()).locks())
-            # putting a file back the way it was saved retires its lock
-            Path("f.txt").write_text("carol\n")
-            as_user("Carol", "c@co", "status")
-            Path("f.txt").write_text("alice2\n")
-            as_user("Carol", "c@co", "status")
-            check("locks: a lock retires when nothing is left to protect",
-                  not Repo(Path(".").resolve()).locks())
-        finally:
-            os.environ.clear(); os.environ.update(env0)
-            os.chdir(old); _sh.rmtree(d, ignore_errors=True)
-            _sh.rmtree(xd, ignore_errors=True)
-
-    @case
-    def shared_locks():
-        d, old = fresh(); os.chdir(d)
-        xd = Path(tempfile.mkdtemp(prefix="sbexp-"))
-        env0 = dict(os.environ)
-        def as_user(n, e, *a, **k):
-            os.environ["SB_NAME"] = n; os.environ["SB_EMAIL"] = e
-            return run(*a, **k)
-        try:
-            as_user("Lead", "l@co", "init")
-            Path("a.py").write_text("v1"); Path("b.py").write_text("v1")
-            as_user("Lead", "l@co", "save", "seed")   # shared is always on
-            # alice edits a.py, bob edits b.py, so two locks
-            Path("a.py").write_text("alice"); as_user("Alice", "a@co", "status")
-            Path("b.py").write_text("bob"); as_user("Bob", "b@co", "status")
-            repo = Repo(Path(".").resolve())
-            locks = repo.locks()
-            check("shared: independent edits lock to their own users",
-                  locks.get("a.py", {}).get("email") == "a@co"
-                  and locks.get("b.py", {}).get("email") == "b@co")
-            # bob saves, so only b.py lands and a.py stays at v1
-            as_user("Bob", "b@co", "save", "bob edit")
-            as_user("Lead", "l@co", "export", "main", str(xd / "chk1"))
-            check("shared: save commits only your files",
-                  (xd / "chk1/a.py").read_text() == "v1"
-                  and (xd / "chk1/b.py").read_text() == "bob")
-            check("shared: others' locks survive your save",
-                  "a.py" in Repo(Path(".").resolve()).locks())
-            # expiry saves the abandoned edit under alice, then reverts it,
-            # so history and disk both return to v1 and sb restore gets it
-            os.environ["SB_LOCK_TTL"] = "1"; time.sleep(2)
-            r = as_user("Lead", "l@co", "status")
-            as_user("Lead", "l@co", "export", "main", str(xd / "chk2"))
-            lg = as_user("Lead", "l@co", "log").stdout
-            check("shared: expired lock auto-saves then auto-reverts",
-                  (xd / "chk2/a.py").read_text() == "v1"
-                  and Path("a.py").read_text() == "v1"
-                  and "auto-save" in lg and "auto-revert" in lg)
-            m_h = re.search(r"restore ([0-9a-f]{4,})", lg)
-            rr = as_user("Lead", "l@co", "restore", m_h.group(1)) if m_h else None
-            check("shared: the auto-saved edits are recoverable via restore",
-                  rr is not None and rr.returncode == 0
-                  and Path("a.py").read_text() == "alice")
-            if rr is not None:              # put the tree back for what follows
-                as_user("Lead", "l@co", "undo")
-            del os.environ["SB_LOCK_TTL"]
-            # merge --ignore skips a locked file and leaves its lock alone
-            Path("c.py").write_text("base"); as_user("Lead", "l@co", "save", "c base")
-            as_user("Lead", "l@co", "branch", "feat")
-            as_user("Lead", "l@co", "switch", "feat")
-            Path("c.py").write_text("feature"); as_user("Lead", "l@co", "save", "c feat")
-            as_user("Lead", "l@co", "switch", "main")
-            Path("c.py").write_text("carol edit"); as_user("Carol", "c@co", "status")
-            r = as_user("Lead", "l@co", "merge", "feat")
-            blocked = r.returncode != 0 and "locked" in (r.stdout + r.stderr).lower()
-            # merge proceeds, c.py keeps our version, the lock survives
-            r2 = as_user("Lead", "l@co", "merge", "feat", "--ignore")
-            repo2 = Repo(Path(".").resolve())
-            as_user("Lead", "l@co", "export", "main", str(xd / "chk3"))
-            skipped_ok = (r2.returncode == 0
-                          and (xd / "chk3/c.py").read_text() != "feature"
-                          and "c.py" in repo2.locks())
-            check("shared: merge blocked by lock; --ignore skips it, lock kept",
-                  blocked and skipped_ok)
-            # unlock --force releases carol's lock
-            r3 = as_user("Lead", "l@co", "unlock", "c.py", "--force")
-            check("shared: sb unlock --force releases others' lock",
-                  r3.returncode == 0
-                  and "c.py" not in Repo(Path(".").resolve()).locks())
-        finally:
-            os.environ.clear(); os.environ.update(env0)
-            os.chdir(old); _sh.rmtree(d, ignore_errors=True)
-            _sh.rmtree(xd, ignore_errors=True)
-
-    print(bold("sb selftest") + dim(f" · {len(cases)} cases"))
-    for fn in cases:
-        try:
-            fn()
-        except Exception as e:
-            failed.append(fn.__name__)
-            print("  " + red("FAIL") + f"  {fn.__name__}: "
-                  f"{type(e).__name__}: {e}")
-    print()
-    if failed:
-        leaf(red(f"{len(passed)} passed, {len(failed)} failed: "
-                 + ", ".join(failed)))
-        sys.exit(1)
-    leaf(green(f"all {len(passed)} checks passed"))
-
-# portable archive
+# === portable archive ===
 # 'sb pack' seals the database and a small manifest into one encrypted
 # .sbox file, 'sb unpack' reverses it. encryption comes from vox, embedded
 # below, so both work offline
@@ -3310,28 +3551,141 @@ SBOX_MAGIC = b"SBOX"
 SBOX_VERSION = 2      # v2 mixes a random salt into the key
 SBOX_SALT_LEN = 16
 
-def _sbox_seal(vox, manifest, body, passphrase):
-    # a fresh random salt goes into the key, so two archives sealed with one
-    # passphrase get different keys and a guess cannot be reused across
-    # them. the salt sits in the header, which is authenticated
-    salt = os.urandom(SBOX_SALT_LEN)
-    header = SBOX_MAGIC + bytes([SBOX_VERSION]) + salt
-    eff_key = salt.hex() + ":" + passphrase
-    blob = vox.encrypt(_frame(manifest, body), eff_key, associated_data=header)
-    return header + blob
+# sealing and opening run over a file a piece at a time, so a large archive
+# never becomes one bytes object. the construction is vox's own: a SIV salt
+# over the plaintext, an HMAC counter keystream, then a tag over the
+# ciphertext. two passes over the file replace the two passes over memory
+STREAM_BLOCK = 64                     # sha512 digest, the keystream block
+STREAM_CHUNK = 1024 * 1024            # a multiple of STREAM_BLOCK
 
-def _sbox_open(vox, raw, passphrase):
-    # inverse of _sbox_seal. handles both salted and older fixed salt
-    # archives, so old .sbox files still open
-    ver = raw[4]
-    if ver >= 2:
-        salt = raw[5:5 + SBOX_SALT_LEN]
-        header = raw[:5 + SBOX_SALT_LEN]
-        blob = raw[5 + SBOX_SALT_LEN:]
-        eff_key = salt.hex() + ":" + passphrase
-        return vox.decrypt(blob, eff_key, associated_data=header)
-    header, blob = raw[:5], raw[5:]          # v1: passphrase used directly
-    return vox.decrypt(blob, passphrase, associated_data=header)
+def _xor_bytes(a, b):
+    n = len(a)
+    return (int.from_bytes(a, "big") ^ int.from_bytes(b[:n], "big")).to_bytes(n, "big")
+
+def _keystream(key, nonce, start_block, nbytes):
+    import hmac
+    out = bytearray()
+    c = start_block
+    while len(out) < nbytes:
+        out += hmac.new(key, nonce + c.to_bytes(5, "big"),
+                        hashlib.sha512).digest()
+        c += 1
+    return bytes(out[:nbytes])
+
+def _iter_file(path, size=None):
+    with open(path, "rb") as f:
+        while True:
+            c = f.read(STREAM_CHUNK)
+            if not c:
+                return
+            yield c
+
+def _sbox_seal_stream(vox, manifest, body_path, passphrase, out_path):
+    # writes header + salt + ciphertext + tag, reading the body twice
+    import hmac
+    head = canonical(manifest)
+    prefix = len(head).to_bytes(4, "big") + head       # the framed manifest
+    salt_hdr = os.urandom(SBOX_SALT_LEN)
+    header = SBOX_MAGIC + bytes([SBOX_VERSION]) + salt_hdr
+    ctx = vox._get_context((salt_hdr.hex() + ":" + passphrase).encode())
+    mac = hmac.new(ctx.mac_key, header + prefix, hashlib.sha512)
+    for chunk in _iter_file(body_path):
+        mac.update(chunk)
+    siv = mac.digest()[:vox.SALT_LEN]
+    tag = hmac.new(ctx.mac_key, siv + header, hashlib.sha512)
+    tmp = out_path.with_name(f".{out_path.name}.{os.urandom(6).hex()}.sbtmp")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW,
+                 0o600)
+    try:
+        with os.fdopen(fd, "wb", closefd=False) as out:
+            out.write(header)
+            out.write(siv)
+            block = 0
+            for chunk in _prefixed(prefix, _iter_file(body_path)):
+                ks = _keystream(ctx.enc_key, siv, block, len(chunk))
+                ct = _xor_bytes(chunk, ks)
+                tag.update(ct)
+                out.write(ct)
+                block += (len(chunk) + STREAM_BLOCK - 1) // STREAM_BLOCK
+            out.write(tag.digest())
+            out.flush()
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, out_path)
+
+def _prefixed(prefix, chunks):
+    # the manifest rides in front of the body, block aligned so the
+    # keystream counter stays simple
+    buf = bytearray(prefix)
+    for c in chunks:
+        buf += c
+        while len(buf) >= STREAM_CHUNK:
+            yield bytes(buf[:STREAM_CHUNK])
+            del buf[:STREAM_CHUNK]
+    if buf:
+        yield bytes(buf)
+
+def _sbox_open_stream(vox, in_path, passphrase, out_path):
+    # verifies the tag before writing a single plaintext byte, then decrypts
+    # into out_path. gives the manifest; the body is what lands in the file
+    import hmac
+    size = in_path.stat().st_size
+    with open(in_path, "rb") as f:
+        head = f.read(5)
+        if head[:4] != SBOX_MAGIC:
+            raise ValueError("not an sbox archive")
+        ver = head[4]
+        if ver != SBOX_VERSION:
+            raise ValueError(f"archive format {ver} is not supported")
+        salt_hdr = f.read(SBOX_SALT_LEN)
+        header = head + salt_hdr
+        siv = f.read(vox.SALT_LEN)
+        ct_start = len(header) + len(siv)
+        ct_len = size - ct_start - vox.TAG_LEN
+        if ct_len < 0:
+            raise ValueError("archive is truncated")
+        ctx = vox._get_context((salt_hdr.hex() + ":" + passphrase).encode())
+        tag = hmac.new(ctx.mac_key, siv + header, hashlib.sha512)
+        left = ct_len
+        while left:
+            c = f.read(min(STREAM_CHUNK, left))
+            if not c:
+                raise ValueError("archive is truncated")
+            tag.update(c)
+            left -= len(c)
+        want = f.read(vox.TAG_LEN)
+        if not hmac.compare_digest(tag.digest(), want):
+            raise ValueError("authentication failed")
+        # second pass: decrypt, peeling the manifest off the front
+        f.seek(ct_start)
+        mac = hmac.new(ctx.mac_key, header, hashlib.sha512)
+        block, left, manifest, pending = 0, ct_len, None, bytearray()
+        with open(out_path, "wb") as out:
+            while left:
+                c = f.read(min(STREAM_CHUNK, left))
+                left -= len(c)
+                pt = _xor_bytes(c, _keystream(ctx.enc_key, siv, block, len(c)))
+                block += (len(c) + STREAM_BLOCK - 1) // STREAM_BLOCK
+                mac.update(pt)
+                if manifest is None:
+                    pending += pt
+                    if len(pending) < 4:
+                        continue
+                    hlen = int.from_bytes(pending[:4], "big")
+                    if len(pending) < 4 + hlen:
+                        continue
+                    manifest = json.loads(bytes(pending[4:4 + hlen]))
+                    out.write(bytes(pending[4 + hlen:]))
+                    pending = bytearray()
+                else:
+                    out.write(pt)
+            if manifest is None:
+                raise ValueError("archive manifest is incomplete")
+            out.flush()
+    if mac.digest()[:vox.SALT_LEN] != siv:
+        raise ValueError("authentication failed")   # SIV self check
+    return manifest
 
 # vox v1.7.3 (jts.gg/vox), embedded verbatim. loaded into memory only while
 # pack, unpack or export runs. nothing else uses it
@@ -3536,106 +3890,142 @@ def load_vox():
         die("the embedded encryption module is missing encrypt/decrypt")
     return mod
 
-def _frame(manifest: dict, db: bytes) -> bytes:
-    head = canonical(manifest)
-    return len(head).to_bytes(4, "big") + head + db
-
-def _write_archive(out: Path, data: bytes):
-    # write to a randomized O_EXCL temp file beside the final name, then
-    # rename it in. a predictable name could be planted as a symlink
-    tmp = out.with_name(f".{out.name}.{os.urandom(6).hex()}.sbtmp")
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW,
-                 0o600)
-    try:
-        view = memoryview(data)
-        off = 0
-        while off < len(view):
-            off += os.write(fd, view[off:])
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    try:
-        os.replace(tmp, out)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            tmp.unlink()
-        raise
-
-def _unframe(payload: bytes):
-    if len(payload) < 4:
-        die("archive payload is truncated — not a complete sandbox archive")
-    n = int.from_bytes(payload[:4], "big")
-    if not 0 < n <= len(payload) - 4:
-        die("archive payload is malformed (manifest length out of range)")
-    try:
-        manifest = json.loads(payload[4:4 + n])
-    except ValueError:
-        die("archive manifest is not valid JSON — the file was altered")
-    if not isinstance(manifest, dict):
-        die("archive manifest is malformed — the file was altered")
-    return manifest, payload[4 + n:]
-
-def _snapshot_db(repo: Repo) -> bytes:
+def _snapshot_db_file(repo: Repo, into: Path) -> Path:
     # a consistent single file copy of the store, with the WAL folded in
     src = repo.vdir / DB_NAME
-    tmp = Path(tempfile.mkdtemp(prefix="sb-pack-")) / "snap.db"
+    tmp = into / "snap.db"
     con = sqlite3.connect(str(src))
     try:
         con.execute("VACUUM INTO ?", (str(tmp),))
     finally:
         con.close()
-    data = tmp.read_bytes()
-    tmp.unlink(); tmp.parent.rmdir()
-    return data
+    return tmp
 
-def _tar_tree(repo, tree) -> bytes:
-    # serialize a saved tree's files into a tar in memory
-    import tarfile, io
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w") as t:
+def sha256_file(path) -> str:
+    h = hashlib.sha256()
+    for c in _iter_file(path):
+        h.update(c)
+    return h.hexdigest()
+
+class _StreamReader(io.RawIOBase):
+    # a read only file over an object's chunks, so tar never holds a whole
+    # large file in memory
+    def __init__(self, chunks):
+        self._chunks, self._buf = iter(chunks), b""
+    def readable(self):
+        return True
+    def readinto(self, b):
+        while not self._buf:
+            try:
+                self._buf = next(self._chunks)
+            except StopIteration:
+                return 0
+        n = min(len(b), len(self._buf))
+        b[:n] = self._buf[:n]
+        self._buf = self._buf[n:]
+        return n
+
+def _tar_tree_file(repo, tree, out: Path) -> Path:
+    # the same tar as _tar_tree, written straight to disk
+    import tarfile
+    with tarfile.open(str(out), mode="w") as t:
         for rel in sorted(tree):
             mode, bh = tree[rel]
-            _, data = repo.get(bh)
             info = tarfile.TarInfo(rel)
-            info.size = len(data)
-            info.mode = 0o755 if mode == "100755" else 0o644
             info.mtime = int(time.time())
-            t.addfile(info, io.BytesIO(data))
-    return buf.getvalue()
+            if is_link_mode(mode):
+                info.type = tarfile.SYMTYPE
+                info.linkname = repo.get(bh)[1].decode("utf-8", "replace")
+                info.size = 0
+                t.addfile(info)
+                continue
+            info.size = repo.db.execute(
+                "SELECT size FROM objects WHERE hash=?", (bh,)).fetchone()[0]
+            info.mode = 0o755 if mode == "100755" else 0o644
+            t.addfile(info, _StreamReader(repo.stream(bh)))
+    return out
 
-def _untar_files(data: bytes, dest: Path) -> int:
-    # extract the archive's files into dest. names are checked first, then
-    # written the same symlink safe way checkout writes
-    import tarfile, io
+def _untar_open(t, dest: Path) -> int:
+    # extract every member of an open tarfile into dest. names are checked
+    # first, then written the same symlink safe way checkout writes. a file
+    # is streamed member by member, so no single one is held whole
     dest.mkdir(parents=True, exist_ok=True)
     root_fd = os.open(str(dest), os.O_RDONLY | _O_DIRECTORY)
     n = 0
     try:
-        with tarfile.open(fileobj=io.BytesIO(data), mode="r") as t:
-            for m in t.getmembers():
-                if not m.isreg():
-                    continue
-                parts = Path(m.name).parts
-                if (m.name.startswith("/")
-                        or any(p in ("..", SB_DIR) for p in parts)
-                        or not all(safe_name(p) for p in parts)):
-                    die(f"archive contains an unsafe path: {m.name!r} — "
-                        f"refusing")
-                rel = "/".join(parts)
-                try:
-                    pfd, leaf = _safe_parent_fd(root_fd, rel)
-                except CheckoutConflict as e:
-                    die(f"refusing to extract {rel!r}: {e}")
-                try:
-                    payload = t.extractfile(m).read()
+        for m in t:
+            if not (m.isreg() or m.issym()):
+                continue
+            parts = Path(m.name).parts
+            if (m.name.startswith("/")
+                    or any(p in ("..", SB_DIR) for p in parts)
+                    or not all(safe_name(p) for p in parts)):
+                die(f"archive contains an unsafe path: {m.name!r} — refusing")
+            rel = "/".join(parts)
+            try:
+                pfd, leaf = _safe_parent_fd(root_fd, rel)
+            except CheckoutConflict as e:
+                die(f"refusing to extract {rel!r}: {e}")
+            try:
+                if m.issym():
                     _remove_at(pfd, leaf)
-                    _write_file_at(pfd, leaf, payload, (m.mode & 0o777) or 0o644)
-                finally:
-                    os.close(pfd)
-                n += 1
+                    _write_symlink_at(pfd, leaf, m.linkname)
+                else:
+                    _remove_at(pfd, leaf)
+                    _write_file_at(pfd, leaf, _tar_pieces(t, m),
+                                   (m.mode & 0o777) or 0o644)
+            finally:
+                os.close(pfd)
+            n += 1
     finally:
         os.close(root_fd)
     return n
+
+def _tar_pieces(t, m):
+    f = t.extractfile(m)
+    while True:
+        c = f.read(1024 * 1024)
+        if not c:
+            return
+        yield c
+
+def _untar_files_from(path: Path, dest: Path) -> int:
+    import tarfile
+    with tarfile.open(str(path), mode="r") as t:
+        return _untar_open(t, dest)
+
+def _checkout_into(repo, tree, dest: Path) -> int:
+    # write a saved tree's files into dest without building a tar at all,
+    # streaming each large file straight from the store
+    dest.mkdir(parents=True, exist_ok=True)
+    root_fd = os.open(str(dest), os.O_RDONLY | _O_DIRECTORY)
+    try:
+        for rel in sorted(tree):
+            mode, h = tree[rel]
+            pfd, leaf = _safe_parent_fd(root_fd, rel)
+            try:
+                _remove_at(pfd, leaf)
+                _materialize_entry(repo, pfd, leaf, mode, h)
+            finally:
+                os.close(pfd)
+    finally:
+        os.close(root_fd)
+    return len(tree)
+
+def _seal_archive(vox, repo, manifest_base, body_writer, key, out):
+    # body_writer(stage_dir) gives the path to the body file. we hash it
+    # streaming, fold hash and size into the manifest, then seal it into
+    # `out` without body or ciphertext ever being held whole
+    stage = Path(tempfile.mkdtemp(prefix="sb-seal-"))
+    try:
+        body_path = body_writer(stage)
+        manifest = dict(manifest_base)
+        manifest["db_sha256"] = sha256_file(body_path)
+        manifest["db_size"] = body_path.stat().st_size
+        _sbox_seal_stream(vox, manifest, body_path, key, out)
+        return manifest
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
 
 def cmd_pack(args):
     repo = need_repo()
@@ -3657,11 +4047,11 @@ def cmd_pack(args):
         if not tree:
             die("nothing saved yet — files-only pack needs at least one save")
         payload_kind = "files"
-        body = _tar_tree(repo, tree)
+        body_writer = lambda stage: _tar_tree_file(repo, tree, stage / "body")
     else:
         payload_kind = "repo"
-        body = _snapshot_db(repo)
-    manifest = {
+        body_writer = lambda stage: _snapshot_db_file(repo, stage)
+    manifest_base = {
         "format": "sbox",
         "sbox_version": SBOX_VERSION,
         "sb_version": VERSION,
@@ -3673,15 +4063,13 @@ def cmd_pack(args):
         "branch": repo.current_branch(),
         "chain_head": repo.chain_head(),
         "files": len(tree),
-        "db_sha256": sha256_hex(body),
-        "db_size": len(body),
     }
     out = Path(out_name) if out_name else Path(f"{repo.root.name}.sbox")
     if out.suffix != ".sbox":
         out = out.with_name(out.name + ".sbox")
     if out.exists():
         die(f"{out} already exists — choose another name or remove it")
-    _write_archive(out, _sbox_seal(vox, manifest, body, key))
+    manifest = _seal_archive(vox, repo, manifest_base, body_writer, key, out)
     with contextlib.suppress(sqlite3.Error, OSError):
         repo.journal("pack", {"output": out.name, "payload": payload_kind,
                               "sha256": manifest["db_sha256"]})
@@ -3711,23 +4099,37 @@ def cmd_unpack(args):
     src = Path(path_name)
     if not src.is_file():
         die(f"no such file: {src}")
-    raw = src.read_bytes()
-    if len(raw) < 5 or raw[:4] != SBOX_MAGIC:
+    with open(src, "rb") as f:
+        head = f.read(5)
+    if len(head) < 5 or head[:4] != SBOX_MAGIC:
         die(f"{src} is not a sandbox archive (bad magic)")
-    ver = raw[4]
-    if ver > SBOX_VERSION:
-        die(f"archive format {ver} is newer than this sb understands "
-            f"({SBOX_VERSION}) — upgrade sb")
+    ver = head[4]
+    if ver != SBOX_VERSION:
+        die(f"archive format {ver} is not what this sb reads "
+            f"({SBOX_VERSION})")
     vox = load_vox()
+    work = Path(tempfile.mkdtemp(prefix="sb-unpack-"))
+    body_path = work / "body"
     try:
-        payload = _sbox_open(vox, raw, key)
-    except Exception:
+        manifest = _sbox_open_stream(vox, src, key, body_path)
+    except ValueError:
+        shutil.rmtree(work, ignore_errors=True)
         die("could not open the archive — wrong pass-key or the file was "
             "altered\n       (vox verifies authenticity before decrypting)")
-    manifest, body = _unframe(payload)
-    if sha256_hex(body) != manifest.get("db_sha256"):
+    except Exception:
+        shutil.rmtree(work, ignore_errors=True)
+        die("could not open the archive — wrong pass-key or the file was "
+            "altered\n       (vox verifies authenticity before decrypting)")
+    if sha256_file(body_path) != manifest.get("db_sha256"):
+        shutil.rmtree(work, ignore_errors=True)
         die("archive integrity check failed — the contents did not match "
             "their recorded hash")
+    try:
+        _do_unpack(args, src, manifest, body_path, dest_name)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+def _do_unpack(args, src, manifest, body_path, dest_name):
     kind = manifest.get("payload", "repo")
     dest = Path(dest_name) if dest_name else Path(manifest.get("repo_name", "sandbox"))
     if dest.exists() and not dest.is_dir():
@@ -3748,7 +4150,7 @@ def cmd_unpack(args):
     if kind == "files":
         # the archive holds files and no history, so only files come out
         dest.mkdir(parents=True, exist_ok=True)
-        n = _untar_files(body, dest)
+        n = _untar_files_from(body_path, dest)
         held = "files only — this archive carries no history"
     elif files_only:
         # full history, but only the files are wanted: restore the store in
@@ -3756,11 +4158,11 @@ def cmd_unpack(args):
         stage = Path(tempfile.mkdtemp(prefix="sb-unpack-"))
         try:
             (stage / SB_DIR).mkdir()
-            (stage / SB_DIR / DB_NAME).write_bytes(body)
+            shutil.copyfile(body_path, stage / SB_DIR / DB_NAME)
             srepo = Repo(stage.resolve())
             tree, _ = head_tree_files(srepo)
             dest.mkdir(parents=True, exist_ok=True)
-            n = _untar_files(_tar_tree(srepo, tree), dest)
+            n = _checkout_into(srepo, tree, dest)
         finally:
             shutil.rmtree(stage, ignore_errors=True)
         held = "files only — history was in the archive but not written"
@@ -3771,7 +4173,7 @@ def cmd_unpack(args):
         stage = Path(tempfile.mkdtemp(prefix="sb-unpack-"))
         try:
             (stage / SB_DIR).mkdir()
-            (stage / SB_DIR / DB_NAME).write_bytes(body)
+            shutil.copyfile(body_path, stage / SB_DIR / DB_NAME)
             try:
                 srepo = Repo(stage.resolve())
                 ok = _verify(srepo, quiet=True)
@@ -3809,10 +4211,15 @@ def cmd_unpack(args):
                      os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_NOFOLLOW,
                      0o600)
         try:
-            view = memoryview(body)
-            off = 0
-            while off < len(view):
-                off += os.write(fd, view[off:])
+            with open(body_path, "rb") as bf:
+                while True:
+                    c = bf.read(1024 * 1024)
+                    if not c:
+                        break
+                    view = memoryview(c)
+                    off = 0
+                    while off < len(view):
+                        off += os.write(fd, view[off:])
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -3890,8 +4297,7 @@ def cmd_export(args):
     if args.key is not None:                    # encrypted .sbox export
         key = args.key or _get_key(args, confirm=True)
         vox = load_vox()
-        body = _tar_tree(repo, tree)
-        manifest = {
+        manifest_base = {
             "format": "sbox", "sbox_version": SBOX_VERSION,
             "sb_version": VERSION, "payload": "files",
             "created": int(time.time()),
@@ -3902,14 +4308,15 @@ def cmd_export(args):
             "label": what, "commit": commit_hash,
             "chain_head": repo.chain_head(),
             "files": len(tree),
-            "db_sha256": sha256_hex(body), "db_size": len(body),
         }
         out = Path(dest_name) if dest_name else Path(f"{repo.root.name}-{what}.sbox")
         if out.suffix != ".sbox":
             out = out.with_name(out.name + ".sbox")
         if out.exists():
             die(f"{out} already exists — choose another name or remove it")
-        _write_archive(out, _sbox_seal(vox, manifest, body, key))
+        manifest = _seal_archive(
+            vox, repo, manifest_base,
+            lambda stage: _tar_tree_file(repo, tree, stage / "body"), key, out)
         with contextlib.suppress(sqlite3.Error, OSError):
             repo.journal("export", {"output": out.name, "of": what,
                                     "commit": commit_hash,
@@ -3928,7 +4335,7 @@ def cmd_export(args):
     if dest.exists() and any(dest.iterdir()):
         die(f"{dest} exists and is not empty — export into a fresh folder")
     dest.mkdir(parents=True, exist_ok=True)
-    n = _untar_files(_tar_tree(repo, tree), dest)
+    n = _checkout_into(repo, tree, dest)
     print(f"{bold('exported')} {amber(str(dest))} {dim('·')} {dim(str(n) + ' file(s)')}")
     tree_print([
         f"version  {how} {dim('·')} {amber(short(commit_hash))}",
@@ -3965,7 +4372,7 @@ def _share_parser(cmd):
     if cmd == "unpack":
         sp.add_argument("-i", "--ignore", action="store_true")
     return sp
-# CLI
+# === CLI ===
 # one usage line per command, shown when its arguments do not parse
 USAGES = {
     "sb":         "sb <command> [arguments]",
@@ -3976,7 +4383,7 @@ USAGES = {
     "sb undo":    "sb undo [-p <path>]",
     "sb branch":  "sb branch [<name>] [-r]",
     "sb switch":  "sb switch <branch>",
-    "sb merge":   "sb merge <branch> [--no-verify] [-i]",
+    "sb merge":   "sb merge <branch> [--no-verify] [-i]  ·  sb merge --abort",
     "sb test":    "sb test [<stage> | guide | list | new <stage> <name>]",
     "sb publish": "sb publish [<label>] [-l] [--no-verify]",
     "sb verify":  "sb verify [-a <hash>]",
@@ -4060,8 +4467,9 @@ HELP = f"""
 {_opt('-r, --remove', 'remove branch <name> instead of creating it')}
 {_row('switch <branch>', 'move between branches')}
 {_row('merge <branch>', 'bring <branch> into the current one', last=True)}
-{_opt('--no-verify', 'skip the pre-merge tests', cont=False)}
-{_opt('-i, --ignore', 'skip files locked by others', cont=False)}
+{_opt('--no-verify', 'skip the pre-merge tests')}
+{_opt('-i, --ignore', 'skip files locked by others')}
+{_opt('--abort', 'a conflicted merge writes markers into the files; save to finish or --abort to drop it', cont=False)}
 
 {amber('quality')}
 {_row('test [<stage>]', 'run test gates in a clean checkout')}
@@ -4133,8 +4541,9 @@ def main(argv=None):
         bp.add_argument("-r", "--remove", action="store_true")
         bp.add_argument("--allow-secrets", action="store_true")
         wp = sub.add_parser("switch"); wp.add_argument("target")
-        mp = sub.add_parser("merge"); mp.add_argument("branch")
+        mp = sub.add_parser("merge"); mp.add_argument("branch", nargs="?")
         mp.add_argument("--no-verify", action="store_true")
+        mp.add_argument("--abort", action="store_true")
         mp.add_argument("-i", "--ignore", action="store_true")
         lkp = sub.add_parser("locks"); lkp.add_argument("args", nargs="*")
         ulp = sub.add_parser("unlock"); ulp.add_argument("paths", nargs="*")
@@ -4153,7 +4562,6 @@ def main(argv=None):
         who = sub.add_parser("who"); who.add_argument("name", nargs="?")
         who.add_argument("email", nargs="?")
         gp = sub.add_parser("ignore"); gp.add_argument("pattern")
-        sub.add_parser("selftest")
         # parse_known_args, so leftovers are blamed on the command that was
         # typed ('sb log: ...') rather than the bare 'sb' parser
         args, extra = p.parse_known_args(argv)
