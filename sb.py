@@ -581,6 +581,15 @@ class Repo:
                  -1 if uid is None else int(uid),
                  -1 if perm is None else int(perm)))
 
+    def update_lock_owner(self, path, owner, email, uid):
+        # re-file an existing lock under a different identity, keeping the
+        # content it protects and its clock. only used to repair a lock that
+        # was attributed to an invented person (see reconcile_lock_identity)
+        with self.transaction():
+            self.db.execute(
+                "UPDATE locks SET owner=?, email=?, uid=? WHERE path=?",
+                (owner, email, -1 if uid is None else int(uid), path))
+
     def update_lock_held(self, path, held, mode, touch=True):
         # the holder edited again, so protect the new content. touch resets
         # the clock, making expiry mean idle time, not total time held
@@ -1410,10 +1419,31 @@ def shared_mode(repo):
     return True
 
 def _my_uid():
+    # the account sb's identity belongs to. under sudo that is the invoking
+    # login, not root: author() and the profile already resolve that way, so
+    # lock ownership has to resolve the same way or 'sudo sb' files itself
+    # under a second, invented person and locks you out of your own edits
+    su = _sudo_user()
+    if su:
+        return su[0]
     try:
         return os.getuid()
     except AttributeError:          # windows has no usable owner signal
         return None
+
+def _my_uids():
+    # every OS account whose files are mine. under sudo a file may be owned
+    # by the login account (edited normally) or by root (written while sb
+    # was elevated); both are the one person sitting here
+    out = set()
+    login = _my_uid()
+    if login is not None:
+        out.add(login)
+    try:
+        out.add(os.getuid())
+    except AttributeError:
+        pass
+    return out
 
 def register_identity(repo):
     # remember which OS account maps to which identity, so edits found on
@@ -1423,11 +1453,23 @@ def register_identity(repo):
         return
     name, email = author()
     key, val = f"uid:{uid}", canonical([name, email]).decode()
-    if repo.meta(key) != val:
+    # an earlier version registered os.getuid(), so a 'sudo sb' run filed
+    # root as this person. left in place, the next person's sudo run would
+    # inherit the name. drop it once, now that the login uid is recorded
+    stale = None
+    try:
+        if uid != 0 and repo.meta("uid:0") == val:
+            stale = "uid:0"
+    except sqlite3.Error:
+        stale = None
+    if repo.meta(key) != val or stale:
         with repo.transaction():        # mapping + journal: one transaction
             repo.set_meta(key, val)
+            if stale:
+                repo.set_meta(stale, "")
             repo.journal("identity", {"uid": uid, "name": name,
-                                      "email": email})
+                                      "email": email,
+                                      **({"cleared": stale} if stale else {})})
 
 def _uid_identity(repo, uid):
     # best known (name, email) for an OS account: the registry if they have
@@ -1608,6 +1650,10 @@ def _lock_actor(repo, lock, st):
     _, me_email = author()
     uid = getattr(st, "st_uid", None) if st is not None else None
     if uid is not None and lock.get("uid", -1) >= 0:
+        if uid in _my_uids():
+            # my login account, or root because sb itself wrote it while
+            # elevated. either way the person who typed the edit is me
+            return me_email
         if uid != lock["uid"]:
             return _uid_identity(repo, uid)[1]        # another account
         registered = _uid_identity(repo, uid)[1]
@@ -1755,6 +1801,7 @@ def acquire_locks_for_edits(repo, quiet=False):
     register_identity(repo)
     name, email = author()
     me_uid = _my_uid()
+    me_uids = _my_uids()
     work = snapshot_worktree(repo, write=True)
     tree_files, _ = head_tree_files(repo)
     a, m, d = worktree_vs_tree(work, tree_files)
@@ -1772,7 +1819,11 @@ def acquire_locks_for_edits(repo, quiet=False):
                 owner_uid = os.lstat(repo.root / p).st_uid
             except OSError:
                 pass
-        if owner_uid is None or owner_uid == me_uid:
+        # a uid that is not mine still isn't someone else if it resolves to
+        # my own identity. attribution exists to tell two people apart, so
+        # it must never split one person into two
+        if (owner_uid is None or owner_uid in me_uids
+                or _uid_identity(repo, owner_uid)[1] == email):
             mine_new.append(p)
         else:
             theirs.setdefault(owner_uid, []).append(p)
@@ -1800,9 +1851,53 @@ def acquire_locks_for_edits(repo, quiet=False):
                             + dim("(their on-disk edit)")
                             for p in sorted(paths)])
 
+def reconcile_lock_identity(repo, quiet=False):
+    # repair locks that an earlier run filed under an identity sb invented.
+    #
+    # when a uid has never run sb, _uid_identity falls back to the system
+    # account name and a synthetic '<name>@uid<N>' email. that is right for
+    # a teammate who has never used sb, and wrong for you: a lock carrying
+    # the synthetic email for an account that is yours is not another
+    # person, it is you under a name sb made up, and it will keep every one
+    # of your saves from committing that file. adopt those, and only those.
+    #
+    # a real registered identity on one of my accounts is left alone: that
+    # is the shared-login case, where the other holder genuinely is someone
+    # else.
+    mine_uids = _my_uids()
+    name, email = author()
+    adopted = []
+    for rel, l in sorted(repo.locks().items()):
+        uid = l.get("uid", -1)
+        if uid < 0 or uid not in mine_uids or l["email"] == email:
+            continue
+        if l["email"] != f"{l['owner']}@uid{uid}":
+            continue                    # a real identity, not an invented one
+        registered = repo.meta(f"uid:{uid}")
+        if registered:
+            try:
+                if json.loads(registered)[1] == l["email"]:
+                    continue            # invented once, since registered
+            except (ValueError, TypeError, IndexError):
+                pass
+        repo.update_lock_owner(rel, name, email, uid)
+        adopted.append(rel)
+    if adopted:
+        with contextlib.suppress(sqlite3.Error):
+            repo.journal("lock-adopt", {"paths": adopted, "to": email,
+                                        "uids": sorted(mine_uids)})
+        if not quiet:
+            tree_print([f"lock on {cyan(p)} " + dim("was filed under an "
+                        "invented identity for your own account — it is "
+                        "yours") for p in adopted])
+    return adopted
+
 def sync_locks(repo, quiet=False):
     # the whole lifecycle, in the only order that keeps content honest:
-    # enforce, expire, then claim. every command touching state runs it
+    # register who I am, adopt locks wrongly filed as someone else's, then
+    # enforce, expire, and claim. every command touching state runs it
+    register_identity(repo)
+    reconcile_lock_identity(repo, quiet=quiet)
     enforce_locks(repo, quiet=quiet)
     process_lock_expiry(repo)
     acquire_locks_for_edits(repo, quiet=quiet)
@@ -3362,6 +3457,13 @@ def cmd_journal(args):
             what = d.get("pattern", "")
         elif e["op"] == "identity":
             what = f"uid {d.get('uid','?')} → {d.get('name','?')} <{d.get('email','?')}>"
+            if d.get("cleared"):
+                what += dim(f"  · cleared stale {d['cleared']} mapping")
+        elif e["op"] == "lock-adopt":
+            paths = d.get("paths", [])
+            what = (", ".join(paths[:3]) + (" …" if len(paths) > 3 else "")
+                    + dim(f"  · re-filed under {d.get('to','?')} "
+                          "(same person, different account)"))
         elif e["op"] == "pack":
             what = f"{d.get('output','')} ({d.get('payload','')})"
         elif e["op"] == "export":
@@ -3443,7 +3545,7 @@ def cmd_locks(args):
     tree_print(rows)
     leaf(dim("a locked file is its holder's until they save: other people's "
              "edits to it are put back\n       release yours: sb unlock "
-             "<path>  ·  someone else's: --force"))
+             "<path>  ·  someone else's: sb unlock <path> --force"))
 
 def cmd_unlock(args):
     repo = need_repo()
@@ -3455,7 +3557,8 @@ def cmd_unlock(args):
         [p for p, l in locks.items() if force or l["email"] == email]
     if not targets:
         print(dim("nothing to unlock" + ("" if force else
-                  " (you hold no locks; --force to release others')")))
+                  " (you hold no locks; 'sb unlock <path> --force' releases "
+                  "someone else's)")))
         return
     freed, denied, missing = [], [], []
     for p in targets:
@@ -3480,8 +3583,8 @@ def cmd_unlock(args):
     if missing:
         leaf(dim(f"{len(missing)} not locked: " + ", ".join(sorted(missing)[:4])))
     if denied:
-        die(f"{len(denied)} held by others — add --force to release: "
-            + ", ".join(sorted(denied)[:4]))
+        die(f"{len(denied)} held by others — 'sb unlock <path> --force' "
+            f"releases them: " + ", ".join(sorted(denied)[:4]))
 
 def cmd_salvage(args):
     # write any stored content back out to a file. mainly the other half of
@@ -4376,12 +4479,13 @@ def _share_parser(cmd):
 # one usage line per command, shown when its arguments do not parse
 USAGES = {
     "sb":         "sb <command> [arguments]",
-    "sb save":    'sb save "<message>" [--allow-secrets] [--no-verify]',
+    "sb save":    'sb save "<message>" [--allow-secrets] [--no-verify]'
+                  ' [--global-force]',
     "sb log":     "sb log [-n <count>]",
     "sb diff":    "sb diff [<path>]",
     "sb restore": "sb restore <anchor | save | release-label | branch>",
     "sb undo":    "sb undo [-p <path>]",
-    "sb branch":  "sb branch [<name>] [-r]",
+    "sb branch":  "sb branch [<name>] [-r] [--allow-secrets]",
     "sb switch":  "sb switch <branch>",
     "sb merge":   "sb merge <branch> [--no-verify] [-i]  ·  sb merge --abort",
     "sb test":    "sb test [<stage> | guide | list | new <stage> <name>]",
@@ -4419,6 +4523,14 @@ def _arg_error(prog, message):
     lines = [f"{prog}: {message}"]
     if prog in USAGES:
         lines.append(f"       usage:  {USAGES[prog]}")
+    # an option that exists, just not here, gets named rather than left to
+    # look like a flag that was removed
+    for flag in sorted(set(re.findall(r"--[a-z][a-z-]*", message))):
+        homes = [c for c, u in USAGES.items()
+                 if re.search(rf"{re.escape(flag)}\b", u) and c != prog]
+        if homes:
+            lines.append(f"       {flag} belongs to:  "
+                         + "  ·  ".join(homes))
     lines.append("       see the full menu:  sb help")
     die("\n".join(lines))
 
@@ -4465,6 +4577,7 @@ HELP = f"""
 {_row('branch [<name>]', 'list branches, or create one — a new branch')}
 {_opt('', 'saves this folder at once, so it is mergeable straight away')}
 {_opt('-r, --remove', 'remove branch <name> instead of creating it')}
+{_opt('--allow-secrets', 'the initial save keeps detected secrets verbatim')}
 {_row('switch <branch>', 'move between branches')}
 {_row('merge <branch>', 'bring <branch> into the current one', last=True)}
 {_opt('--no-verify', 'skip the pre-merge tests')}
