@@ -4,12 +4,14 @@
 
 import sys, os, io, json, time, zlib, hashlib, fnmatch, difflib, re
 import argparse, contextlib
+import select
+import signal
 import sqlite3, subprocess, tempfile, getpass, shutil, stat
 from pathlib import Path
 
 VERSION = "1.3"
 AUTHOR = "jts.gg/sandbox"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 CHUNK_THRESHOLD = 8 * 1024 * 1024   # bigger than this is stored in pieces
 CHUNK_SIZE = 1024 * 1024            # one piece
 SB_DIR = ".sb"
@@ -115,7 +117,6 @@ CREATE TABLE IF NOT EXISTS statcache (
 CREATE TABLE IF NOT EXISTS locks (
     path   TEXT PRIMARY KEY,
     owner  TEXT NOT NULL,
-    email  TEXT NOT NULL,
     since  INTEGER NOT NULL,
     base   TEXT NOT NULL DEFAULT '',
     held   TEXT NOT NULL DEFAULT '',
@@ -228,7 +229,7 @@ class Repo:
             self.db.execute(
                 "CREATE TABLE IF NOT EXISTS locks ("
                 "path TEXT PRIMARY KEY, owner TEXT NOT NULL, "
-                "email TEXT NOT NULL, since INTEGER NOT NULL, "
+                "since INTEGER NOT NULL, "
                 "base TEXT NOT NULL DEFAULT '')")
             cols = {r[1] for r in self.db.execute("PRAGMA table_info(locks)")}
             if "held" not in cols:
@@ -555,40 +556,40 @@ class Repo:
 
     # === locks ===
     def locks(self):
-        # {path: {owner, email, since, base, held, mode, uid}}. held is the
+        # {path: {owner, since, base, held, mode, uid}}. held is the
         # content being protected, LOCK_DELETED if the holder deleted it, or
         # empty for a lock older than content tracking
         out = {}
-        for (path, owner, email, since, base, held, mode, uid,
+        for (path, owner, since, base, held, mode, uid,
              perm) in self.db.execute(
-                "SELECT path,owner,email,since,base,held,mode,uid,perm "
+                "SELECT path,owner,since,base,held,mode,uid,perm "
                 "FROM locks"):
-            out[path] = {"owner": owner, "email": email, "since": since,
+            out[path] = {"owner": owner, "since": since,
                          "base": base, "held": held or "",
                          "mode": mode or "100644",
                          "uid": -1 if uid is None else int(uid),
                          "perm": -1 if perm is None else int(perm)}
         return out
 
-    def set_lock(self, path, owner, email, base, held="", mode="100644",
+    def set_lock(self, path, owner, base, held="", mode="100644",
                  uid=-1, perm=-1):
         with self.transaction():
             self.db.execute(
-                "INSERT INTO locks(path,owner,email,since,base,held,mode,uid,"
-                "perm) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO NOTHING",
-                (path, owner, email, int(time.time()), base or "",
+                "INSERT INTO locks(path,owner,since,base,held,mode,uid,"
+                "perm) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(path) DO NOTHING",
+                (path, owner, int(time.time()), base or "",
                  held or "", mode or "100644",
                  -1 if uid is None else int(uid),
                  -1 if perm is None else int(perm)))
 
-    def update_lock_owner(self, path, owner, email, uid):
+    def update_lock_owner(self, path, owner, uid):
         # re-file an existing lock under a different identity, keeping the
         # content it protects and its clock. only used to repair a lock that
-        # was attributed to an invented person (see reconcile_lock_identity)
+        # was attributed to the wrong account (see unlock --force)
         with self.transaction():
             self.db.execute(
-                "UPDATE locks SET owner=?, email=?, uid=? WHERE path=?",
-                (owner, email, -1 if uid is None else int(uid), path))
+                "UPDATE locks SET owner=?, uid=? WHERE path=?",
+                (owner, -1 if uid is None else int(uid), path))
 
     def update_lock_held(self, path, held, mode, touch=True):
         # the holder edited again, so protect the new content. touch resets
@@ -615,22 +616,23 @@ def need_repo() -> Repo:
     if not root:
         die("not inside a sandbox repository (run 'sb init')")
     repo = Repo(root)
-    # record which OS account this identity uses, so later edits found on
-    # disk can be attributed. best effort, never blocks
-    if shared_mode(repo):
-        try:
-            register_identity(repo)
-        except sqlite3.Error:
-            pass
+    # a repository the watcher does not know about produces no events, and
+    # an unobserved change would quietly fall back to guessing from file
+    # ownership — the exact failure this design exists to remove. registering
+    # costs nothing and repos.d is writable by anyone, so heal it in place
+    # rather than depending on whether init or the migration got there first
+    if service_installed() and not repo_is_registered(root):
+        register_repo(root)
     return repo
 
 # === identity ===
-# who made each save, for humans reading history. no keys, no signatures:
-# attribution, not authentication
+# a person is an OS account. there is no profile, no configured name, no
+# email: the account that runs sb is who you are, and the account that owns
+# a file is who it belongs to. nothing here can drift out of step with the
+# file system, which is the whole point.
 def _sudo_user():
     # the account that invoked sudo, as (uid, gid, name, home), else None.
-    # under sudo HOME is root's, so the profile would be missed and every
-    # save, pack and export would be filed under root
+    # under sudo the process is root, but the person is not
     uid = os.environ.get("SUDO_UID")
     if not uid:
         return None
@@ -643,22 +645,19 @@ def _sudo_user():
         return (int(uid), -1, name, None) if name else None
 
 def _my_uid():
-    # the account sb's identity belongs to. under sudo that is the invoking
-    # login, not root: the profile resolves that way, so lock ownership has
-    # to resolve the same way or 'sudo sb' files itself under a second,
-    # invented person and locks you out of your own edits
+    # the account sb is acting as. under sudo that is the invoking login,
+    # not root
     su = _sudo_user()
     if su:
         return su[0]
     try:
         return os.getuid()
-    except AttributeError:          # windows has no usable owner signal
+    except AttributeError:          # no owner signal on this platform
         return None
 
 def _my_uids():
-    # every OS account whose files are mine. under sudo a file may be owned
-    # by the login account (edited normally) or by root (written while sb
-    # was elevated); both are the one person sitting here
+    # every account whose writes are mine: my login, plus root when sb is
+    # running elevated on my behalf
     out = set()
     login = _my_uid()
     if login is not None:
@@ -669,48 +668,36 @@ def _my_uids():
         pass
     return out
 
-def _account_home():
-    # the home directory of the account sb is running as, taken from the
-    # password database rather than $HOME.
-    #
-    # 'su bob' without '-' leaves HOME pointing at the previous user, and a
-    # profile read out of someone else's home files every save, lock and
-    # export under their name. the password database cannot drift that way.
-    uid = _my_uid()
-    if uid is not None:
-        try:
-            import pwd
-            return Path(pwd.getpwuid(uid).pw_dir)
-        except (ImportError, KeyError, OSError):
-            pass
-    return Path.home()
+def uid_name(uid):
+    # the system account name for a uid, straight from the password
+    # database. no registry, no cache: one source of truth
+    if uid is None or uid < 0:
+        return "?"
+    try:
+        import pwd
+        return pwd.getpwuid(uid).pw_name
+    except (ImportError, KeyError, OSError):
+        return f"uid{uid}"
 
-def _config_dir():
-    # where the profile lives: SB_HOME, else the home of the account this
-    # process is actually running as
-    if os.environ.get("SB_HOME"):
-        return Path(os.environ["SB_HOME"])
-    return _account_home() / ".config" / "sandbox"
-
-CONFIG_DIR = _config_dir()
-CONFIG_FILE = CONFIG_DIR / "profile.json"
+def name_uid(name):
+    # the uid for a system account name, or None if there is no such account
+    try:
+        import pwd
+        return pwd.getpwnam(name).pw_uid
+    except (ImportError, KeyError, OSError):
+        return None
 
 def author():
-    prof = {}
-    if CONFIG_FILE.is_file():
-        try:
-            prof = json.loads(CONFIG_FILE.read_text())
-        except (OSError, json.JSONDecodeError):
-            pass
-    su = _sudo_user()
-    fallback = (su[2] if su and su[2] else None) or getpass.getuser()
-    name = os.environ.get("SB_NAME") or prof.get("name") or fallback
-    email = os.environ.get("SB_EMAIL") or prof.get("email") or f"{name}@local"
-    return name, email
+    # who the current operation is attributed to: my account name
+    return uid_name(_my_uid())
 
 # === ignores ===
 DEFAULT_IGNORES = [SB_DIR, "*.sbox", "*.pyc", "__pycache__", ".DS_Store",
-                   ".git", "node_modules"]
+    ".git", ".svn", "node_modules", "*.egg-info", ".venv", "venv",
+    # editor scratch. these appear and vanish mid-save; tracking them
+    # locks files that were never real work and leaves dead locks behind
+    "*.swp", "*.swo", "*.swn", ".*.swp", ".*.swo", "*~", ".#*", "#*#",
+    "4913", ".goutputstream-*", "*.tmp", ".~lock.*"]
 
 def load_ignores(root: Path):
     pats = list(DEFAULT_IGNORES)
@@ -995,9 +982,9 @@ def read_tree(repo: Repo, tree_hash: str, prefix="") -> dict:
 
 # === commits ===
 def make_commit(repo: Repo, tree_hash, parents, message) -> str:
-    name, email = author()
+    name = author()
     c = {"tree": tree_hash, "parents": list(parents), "author": name,
-         "email": email, "time": int(time.time()), "message": message}
+         "time": int(time.time()), "message": message}
     return repo.put("commit", canonical(c))
 
 def parse_commit(repo: Repo, h: str) -> dict:
@@ -1460,49 +1447,6 @@ def shared_mode(repo):
 
 # _my_uid / _my_uids live up with the identity code, above CONFIG_DIR
 
-def register_identity(repo):
-    # remember which OS account maps to which identity, so edits found on
-    # disk can be attributed to whoever wrote them
-    uid = _my_uid()
-    if uid is None:
-        return
-    name, email = author()
-    key, val = f"uid:{uid}", canonical([name, email]).decode()
-    # an earlier version registered os.getuid(), so a 'sudo sb' run filed
-    # root as this person. left in place, the next person's sudo run would
-    # inherit the name. drop it once, now that the login uid is recorded
-    stale = None
-    try:
-        if uid != 0 and repo.meta("uid:0") == val:
-            stale = "uid:0"
-    except sqlite3.Error:
-        stale = None
-    if repo.meta(key) != val or stale:
-        with repo.transaction():        # mapping + journal: one transaction
-            repo.set_meta(key, val)
-            if stale:
-                repo.set_meta(stale, "")
-            repo.journal("identity", {"uid": uid, "name": name,
-                                      "email": email,
-                                      **({"cleared": stale} if stale else {})})
-
-def _uid_identity(repo, uid):
-    # best known (name, email) for an OS account: the registry if they have
-    # run sb here, else their system account name
-    v = repo.meta(f"uid:{uid}")
-    if v:
-        try:
-            name, email = json.loads(v)
-            return name, email
-        except (ValueError, TypeError):
-            pass
-    try:
-        import pwd
-        name = pwd.getpwuid(uid).pw_name
-    except Exception:
-        name = f"uid{uid}"
-    return name, f"{name}@uid{uid}"
-
 def _restore_paths_on_disk(repo, targets, locks=None):
     # write {rel: (mode, hash) or None} onto the worktree, None meaning
     # remove. same symlink safe writes as checkout
@@ -1593,6 +1537,41 @@ def _chmod_quiet(path, bits):
     except OSError:
         return False
 
+def _chown_quiet(path, uid):
+    # give a file to its lock holder. ownership is what sb reads to decide
+    # who edited a file, so leaving it to the OS lets it drift: a file keeps
+    # its creator forever if everyone edits in place, and the creator ends
+    # up holding locks against work they never touched.
+    #
+    # only the superuser may hand a file to another account, so this is a
+    # no-op for an ordinary run. that is correct: without privilege the
+    # writer already owns what they create, and the signal is accurate
+    # anyway. it matters under sudo, where every write lands as root.
+    if uid is None or uid < 0:
+        return False
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if st.st_uid == uid:
+        return False                    # already right, nothing to do
+    gid = -1
+    try:
+        import pwd
+        gid = pwd.getpwuid(uid).pw_gid
+    except (ImportError, KeyError, OSError):
+        gid = -1
+    try:
+        os.chown(path, uid, gid, follow_symlinks=False)
+        return True
+    except (OSError, NotImplementedError):
+        return False                    # unprivileged, or a filesystem
+                                        # that will not take it
+
+def lock_own_to_holder(repo, rel, uid):
+    # the file belongs to whoever holds the lock on it
+    return _chown_quiet(repo.root / rel, uid)
+
 def lock_perms_on(repo, rel, perm=None):
     # drop group and other write, keep the holder's own
     full = repo.root / rel
@@ -1618,6 +1597,11 @@ def apply_lock_perms(repo, locks=None):
     # idempotent: any command may have rewritten a locked file
     for rel, l in (locks if locks is not None else repo.locks()).items():
         lock_perms_on(repo, rel, l.get("perm", -1))
+        # ownership is half the lock: the permission bits stop other people
+        # writing, the owner uid records who the file is for. re-asserted
+        # every sync, so a write that got through does not carry ownership
+        # away with it
+        lock_own_to_holder(repo, rel, l.get("uid", -1))
 
 def release_locks(repo, paths):
     # restore permissions first, then drop the rows
@@ -1630,35 +1614,830 @@ def release_locks(repo, paths):
             lock_perms_off(repo, rel, locks[rel].get("perm", -1))
     repo.clear_locks(paths)
 
-def lock_is_mine(lock, my_uids=None, my_email=None):
-    # the one place that answers "is this lock mine?".
+# === write attribution service ===
+# the file system records who *owns* a file, never who *wrote* to it. an
+# in-place write (>>, sed, nano, any editor that truncates) therefore leaves
+# no trace of its author, and ownership alone will attribute it to whoever
+# created the file. that is the whole class of bug this service exists to
+# remove.
+#
+# fanotify reports every completed write together with the pid that made it,
+# and /proc/<pid> turns that pid into an account. the kernel is the witness,
+# so nothing has to be inferred.
+#
+# the service is deliberately one process for the whole machine: repositories
+# register with it, it watches the mounts they live on, and it writes to its
+# own store. it never writes into a repository database — that would put a
+# root-owned writer inside a user's file.
+
+SERVICE_DIR   = Path("/var/lib/sandbox")
+EVENTS_DB     = SERVICE_DIR / "events.db"
+SERVICE_UNIT  = "sandbox-watch.service"
+UNIT_PATH     = Path("/etc/systemd/system") / SERVICE_UNIT
+PIDFILE       = SERVICE_DIR / "watch.pid"
+# a pid file cannot make a singleton: it goes stale when a process is killed
+# outright, and two starts can race between reading it and writing it. an
+# exclusive advisory lock can, because the kernel drops it when the holder
+# dies, however it dies. duplicate watchers are not a cosmetic problem —
+# each one opens its own coverage window, so stopping "the" watcher would
+# leave others reporting that everything is still being observed
+LOCKFILE      = SERVICE_DIR / "watch.lock"
+# repositories register themselves here. the event store is root-owned, but
+# 'sb init' is not a root command, so registration cannot go through the
+# database. this directory is world-writable with the sticky bit, exactly
+# like /tmp: anyone may add their repository, nobody may remove another's
+REPOS_DIR     = SERVICE_DIR / "repos.d"
+MAX_REPOS     = 512
+HEARTBEAT_SEC = 5           # how often the watcher says it is alive
+GAP_GRACE_SEC = 15          # heartbeat older than this means it stopped
+# a CLOSE_WRITE is recorded at or after the write it describes, so an event
+# that predates a file's mtime cannot be the thing that produced it. the only
+# tolerance needed is for whole-second rounding. anything wider lets an
+# earlier, legitimate write by somebody else be credited with a later change
+EVENT_SKEW_SEC = 1
+EVENT_RETAIN  = 30 * 86400  # keep a month of attribution history
+
+EVENTS_SCHEMA = """
+PRAGMA journal_mode=WAL;
+CREATE TABLE IF NOT EXISTS events (
+    id       INTEGER PRIMARY KEY,
+    ts       INTEGER NOT NULL,
+    path     TEXT    NOT NULL,
+    -- the inode, which is what actually identifies the bytes. an editor
+    -- that saves by writing a temp file and renaming it over the target
+    -- closes the temp path, never the final one, so a watch keyed only on
+    -- names sees nothing at all. the inode survives the rename
+    dev      INTEGER NOT NULL DEFAULT -1,
+    ino      INTEGER NOT NULL DEFAULT -1,
+    in_repo  INTEGER NOT NULL DEFAULT 1,
+    uid      INTEGER NOT NULL,
+    loginuid INTEGER NOT NULL DEFAULT -1,
+    pid      INTEGER NOT NULL DEFAULT -1,
+    comm     TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS ev_path ON events(path, ts);
+CREATE INDEX IF NOT EXISTS ev_ino  ON events(dev, ino, ts);
+CREATE INDEX IF NOT EXISTS ev_ts   ON events(ts);
+-- one row per run of the watcher. a change whose mtime falls outside every
+-- window happened while nothing was watching, and is reported as unknown
+-- rather than guessed at
+CREATE TABLE IF NOT EXISTS coverage (
+    id        INTEGER PRIMARY KEY,
+    -- fractional seconds on purpose. with whole seconds a watcher shutting
+    -- down and an edit made immediately afterwards share a timestamp, and
+    -- the edit reads as observed when nothing observed it
+    started   REAL NOT NULL,
+    last_seen REAL NOT NULL,
+    -- 1 once the watcher has shut down and written its final heartbeat.
+    -- an open window may extend to now; a closed one ends exactly at
+    -- last_seen, so an edit made one second after a clean stop is correctly
+    -- outside every window and reported as unattributed
+    closed    INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS repos (
+    root  TEXT PRIMARY KEY,
+    added INTEGER NOT NULL
+);
+"""
+
+def events_db(create=False, write=False):
+    # the service store. readable by everyone, writable only by root
+    if not EVENTS_DB.exists() and not create:
+        return None
+    if create:
+        SERVICE_DIR.mkdir(parents=True, exist_ok=True)
+        REPOS_DIR.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            os.chmod(SERVICE_DIR, 0o755)
+            os.chmod(REPOS_DIR, 0o1777)     # sticky: add yours, not remove mine
+    try:
+        db = sqlite3.connect(
+            f"file:{EVENTS_DB}?mode={'rwc' if create else ('rw' if write else 'ro')}",
+            uri=True, timeout=10)
+    except sqlite3.Error:
+        return None
+    if create:
+        db.executescript(EVENTS_SCHEMA)
+        cols = {r[1] for r in db.execute("PRAGMA table_info(coverage)")}
+        if "closed" not in cols:
+            db.execute("ALTER TABLE coverage ADD COLUMN "
+                       "closed INTEGER NOT NULL DEFAULT 0")
+        db.commit()
+        with contextlib.suppress(OSError):
+            os.chmod(EVENTS_DB, 0o644)
+    return db
+
+# --- fanotify, through ctypes: no packages, no auditd -------------------
+FAN_CLOEXEC, FAN_NONBLOCK, FAN_CLASS_NOTIF = 0x01, 0x02, 0x00
+FAN_CLOSE_WRITE   = 0x00000008
+FAN_MARK_ADD      = 0x00000001
+FAN_MARK_MOUNT    = 0x00000010
+FAN_REPORT_PIDFD  = 0x00000080
+FAN_INFO_PIDFD    = 4          # FAN_EVENT_INFO_TYPE_PIDFD
+
+def _libc():
+    import ctypes, ctypes.util
+    return ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+
+def mount_of(path):
+    # the mount point a path lives on. a mount mark is recursive, so this
+    # is what makes coverage of a repository complete: every directory,
+    # including ones created after the watch started
+    p = Path(path).resolve()
+    best = "/"
+    try:
+        with open("/proc/mounts") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                mp = parts[1].replace("\\040", " ")
+                if (str(p) == mp or str(p).startswith(mp.rstrip("/") + "/")) \
+                        and len(mp) > len(best):
+                    best = mp
+    except OSError:
+        pass
+    return best
+
+def _proc_identity(pid, pidfd=None):
+    # who a pid belongs to. loginuid is set by PAM at login and cannot be
+    # changed without CAP_AUDIT_CONTROL, so it survives sudo and su and,
+    # unlike $SUDO_UID, cannot be forged by the person running the command
+    base = f"/proc/{pid}"
+    uid = loginuid = -1
+    comm = ""
+    try:
+        with open(f"{base}/status") as fh:
+            for line in fh:
+                if line.startswith("Uid:"):
+                    uid = int(line.split()[1])       # real uid
+                    break
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        with open(f"{base}/loginuid") as fh:
+            v = int(fh.read().strip())
+            loginuid = -1 if v == 0xFFFFFFFF else v
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(f"{base}/comm") as fh:
+            comm = fh.read().strip()[:64]
+    except OSError:
+        pass
+    return uid, loginuid, comm
+
+class Watcher:
+    # one fanotify fd, a mount mark per mount holding a repository, and a
+    # batched writer into the event store
+    def __init__(self):
+        import ctypes
+        self.ctypes = ctypes
+        self.libc = _libc()
+        self.fd = -1
+        self.marked = set()
+        self.roots = []
+        self.pending = []
+        self.have_pidfd = False
+
+    def start(self):
+        ctypes = self.ctypes
+        # ask for pidfd reporting first: it pins the writing process so a
+        # short-lived one cannot exit before we identify it
+        for flags in (FAN_CLOEXEC | FAN_NONBLOCK | FAN_CLASS_NOTIF | FAN_REPORT_PIDFD,
+                      FAN_CLOEXEC | FAN_NONBLOCK | FAN_CLASS_NOTIF):
+            fd = self.libc.fanotify_init(flags, 0)
+            if fd >= 0:
+                self.fd = fd
+                self.have_pidfd = bool(flags & FAN_REPORT_PIDFD)
+                return True
+        err = ctypes.get_errno()
+        raise OSError(err, f"fanotify_init: {os.strerror(err)}")
+
+    def mark(self, mountpoint):
+        if mountpoint in self.marked:
+            return True
+        ctypes = self.ctypes
+        r = self.libc.fanotify_mark(
+            self.fd, FAN_MARK_ADD | FAN_MARK_MOUNT,
+            ctypes.c_uint64(FAN_CLOSE_WRITE), -1, str(mountpoint).encode())
+        if r < 0:
+            err = ctypes.get_errno()
+            raise OSError(err, f"fanotify_mark {mountpoint}: {os.strerror(err)}")
+        self.marked.add(mountpoint)
+        return True
+
+    def set_roots(self, roots):
+        self.roots = [str(Path(r).resolve()) for r in roots]
+        for r in self.roots:
+            with contextlib.suppress(OSError):
+                self.mark(mount_of(r))
+
+    def _interesting(self, path):
+        for r in self.roots:
+            if path == r or path.startswith(r + "/"):
+                if f"/{SB_DIR}/" in path + "/":
+                    return None             # sb's own store is not user work
+                return r
+        return None
+
+    def read_events(self):
+        # metadata is 24 bytes; with FAN_REPORT_PIDFD an info record follows
+        import struct
+        out = []
+        try:
+            buf = os.read(self.fd, 1 << 16)
+        except (BlockingIOError, InterruptedError):
+            return out
+        except OSError:
+            return out
+        off = 0
+        while off + 24 <= len(buf):
+            ev_len, _vers, _res, meta_len, _mask, evfd, pid = \
+                struct.unpack_from("=IBBHQii", buf, off)
+            if ev_len < 24 or off + ev_len > len(buf):
+                break
+            pidfd = -1
+            if self.have_pidfd and ev_len > meta_len:
+                o = off + meta_len
+                while o + 8 <= off + ev_len:
+                    hdr_type, hdr_len = struct.unpack_from("=HH", buf, o)
+                    if hdr_len < 8:
+                        break
+                    if hdr_type == FAN_INFO_PIDFD and o + 12 <= off + ev_len:
+                        pidfd = struct.unpack_from("=i", buf, o + 8)[0]
+                    o += hdr_len
+            path, dev, ino = None, -1, -1
+            if evfd >= 0:
+                with contextlib.suppress(OSError):
+                    path = os.readlink(f"/proc/self/fd/{evfd}")
+                with contextlib.suppress(OSError):
+                    st = os.fstat(evfd)
+                    dev, ino = st.st_dev, st.st_ino
+                os.close(evfd)
+            # a pidfd keeps /proc/<pid> alive even if the writer has exited
+            ident_pid = pid
+            if pidfd >= 0:
+                ident_pid = pid
+            if path:
+                out.append((path, ident_pid, pidfd, dev, ino))
+            elif pidfd >= 0:
+                os.close(pidfd)
+                pidfd = -1
+            off += ev_len
+        return out
+
+    def close(self):
+        if self.fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(self.fd)
+            self.fd = -1
+
+def _enforce_repo_access(root):
+    # applied by the watcher, which is root and therefore the only thing on
+    # the machine that can hand a file to another account. sb itself runs as
+    # whoever typed the command and usually cannot chown, so leaving this to
+    # sb left a lock holder unable to write the file they had just locked.
     #
-    # the OS account that took the lock is the stable signal. the email is
-    # display metadata: it moves when you run 'sb who', when $HOME points
-    # somewhere else, when a profile is missing, when sb has to invent an
-    # identity for an unregistered account. none of those make your own
-    # edit someone else's work, so none of them may decide this.
-    #
-    # email is consulted only when there is no uid to go on: locks written
-    # by a format older than uid tracking, and platforms with no owner
-    # signal. one login shared by several sb identities also lands here and
-    # resolves in favour of the account, which is how sb already attributes
-    # the writes themselves.
+    # the watcher only READS a repository database. it never writes one: a
+    # root writer inside a user's file is how you get root-owned WAL files
+    # and two writers on one database
+    dbp = Path(root) / SB_DIR / DB_NAME
+    try:
+        db = sqlite3.connect(f"file:{dbp}?mode=ro", uri=True, timeout=2)
+    except sqlite3.Error:
+        return
+    try:
+        creator = None
+        roster = []
+        for k, v in db.execute("SELECT key,value FROM meta WHERE key IN "
+                               "(?,?)", (CREATOR_KEY, ROSTER_KEY)):
+            if k == CREATOR_KEY:
+                with contextlib.suppress(TypeError, ValueError):
+                    creator = int(v)
+            else:
+                with contextlib.suppress(ValueError, TypeError):
+                    roster = [int(u) for u in json.loads(v or "[]")]
+        if creator is None:
+            return
+        if creator not in roster:
+            roster.insert(0, creator)
+        locks = {r[0]: r[1] for r in
+                 db.execute("SELECT path, uid FROM locks")}
+        tracked = set(locks)
+        # the committed file list, read straight from the head trees. the
+        # stat cache used to be the source here, and it is the wrong one: it
+        # is a cache, it is empty after a migration or a fresh clone, and an
+        # empty file list means nothing gets its ownership applied at all
+        def walk(tree_hash, prefix="", depth=0):
+            if depth > 64:
+                return
+            row = db.execute("SELECT kind,data FROM objects WHERE hash=?",
+                             (tree_hash,)).fetchone()
+            if not row or row[0] != "tree":
+                return
+            try:
+                entries = json.loads(zlib.decompress(row[1]) or b"[]")
+            except (zlib.error, ValueError, TypeError):
+                return
+            for ent in entries:
+                try:
+                    mode, kind, h, name = ent
+                except (ValueError, TypeError):
+                    continue
+                if not name or "/" in name or name in (".", ".."):
+                    continue
+                if kind == "tree":
+                    walk(h, prefix + name + "/", depth + 1)
+                else:
+                    tracked.add(prefix + name)
+        for (chash,) in db.execute("SELECT DISTINCT hash FROM refs"):
+            crow = db.execute("SELECT kind,data FROM objects WHERE hash=?",
+                              (chash,)).fetchone()
+            if not crow or crow[0] != "commit":
+                continue
+            try:
+                cm = json.loads(zlib.decompress(crow[1]))
+            except (zlib.error, ValueError, TypeError):
+                continue
+            if cm.get("tree"):
+                walk(cm["tree"])
+        for (path,) in db.execute("SELECT DISTINCT path FROM statcache"):
+            tracked.add(path)
+    except sqlite3.Error:
+        return
+    finally:
+        with contextlib.suppress(sqlite3.Error):
+            db.close()
+    rootp = Path(root)
+    dirs = {""}
+    for rel in sorted(tracked):
+        full = rootp / rel
+        try:
+            st = os.lstat(full)
+        except OSError:
+            continue
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+            continue
+        holder = locks.get(rel)
+        holder = int(holder) if holder is not None and int(holder) >= 0 else None
+        own = holder if holder is not None else creator
+        writers = [holder] if holder is not None else list(roster)
+        execable = bool(st.st_mode & 0o100)
+        _chmod_quiet(full, 0o644 | (0o111 if execable else 0))
+        _acl_apply(full, [w for w in writers if w is not None and w != own],
+                   execable)
+        _chown_quiet(full, own)
+        parts = rel.split("/")[:-1]
+        for i in range(len(parts)):
+            dirs.add("/".join(parts[:i + 1]))
+    for d in sorted(dirs):
+        full = rootp / d if d else rootp
+        try:
+            if not stat.S_ISDIR(os.lstat(full).st_mode):
+                continue
+        except OSError:
+            continue
+        _chmod_quiet(full, 0o755)
+        _acl_apply(full, [u for u in roster if u != creator], execable=True)
+        _chown_quiet(full, creator)
+    # the store itself. every member has to be able to write it or only the
+    # creator can ever save, and sqlite needs to create its -wal and -shm
+    # beside the database, so the directory must be writable too
+    others = [u for u in roster if u != creator]
+    vdir = rootp / SB_DIR
+    try:
+        if stat.S_ISDIR(os.lstat(vdir).st_mode):
+            _chmod_quiet(vdir, 0o770)
+            _acl_apply(vdir, others, execable=True)
+            _chown_quiet(vdir, creator)
+    except OSError:
+        return
+    for extra in (DB_NAME, DB_NAME + "-wal", DB_NAME + "-shm"):
+        f = vdir / extra
+        try:
+            os.lstat(f)
+        except OSError:
+            continue
+        _chmod_quiet(f, 0o660)
+        _acl_apply(f, others)
+        _chown_quiet(f, creator)
+
+def _singleton_lock():
+    # returns the held fd, or None if another watcher already has it
+    import fcntl
+    SERVICE_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(LOCKFILE), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    os.truncate(fd, 0)
+    os.write(fd, str(os.getpid()).encode())
+    return fd
+
+def watcher_locked_by():
+    # pid of the running watcher, read from the lock file, or None if the
+    # lock is free. asking the lock rather than a pid file means a killed
+    # watcher never leaves a ghost behind
+    import fcntl
+    if not LOCKFILE.exists():
+        return None
+    try:
+        fd = os.open(str(LOCKFILE), os.O_RDWR)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return None                      # nobody holds it
+    except OSError:
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            return int(os.read(fd, 32).decode().strip() or 0) or None
+        except (OSError, ValueError):
+            return -1                    # held, pid unreadable
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+def watcher_main():
+    # the service process. writes only to its own store
+    lock_fd = _singleton_lock()
+    if lock_fd is None:
+        sys.stderr.write("another watcher is already running\n")
+        return 0
+    db = events_db(create=True)
+    if db is None:
+        sys.stderr.write("cannot open the event store\n")
+        return 1
+    w = Watcher()
+    try:
+        w.start()
+    except OSError as e:
+        sys.stderr.write(f"fanotify unavailable: {e}\n")
+        return 1
+    now = time.time()
+    cur = db.execute("INSERT INTO coverage(started,last_seen) VALUES(?,?)",
+                     (now, now))
+    cov_id = cur.lastrowid
+    db.commit()
+    with contextlib.suppress(OSError):
+        PIDFILE.write_text(str(os.getpid()))
+
+    stopping = {"v": False}
+    def _stop(signum, frame):
+        stopping["v"] = True
+    with contextlib.suppress(ValueError, OSError):
+        signal.signal(signal.SIGTERM, _stop)
+        signal.signal(signal.SIGINT, _stop)
+
+    def reload_roots():
+        roots = registered_repos()
+        w.set_roots(roots)
+        now2 = int(time.time())
+        db.executemany("INSERT OR IGNORE INTO repos(root,added) VALUES(?,?)",
+                       [(r, now2) for r in roots])
+        db.commit()
+    reload_roots()
+
+    last_beat = last_reload = last_prune = time.time()
+    enforced = {}                # repo root -> store mtime last acted on
+    seen = {}                    # (path, pid) -> ts, collapses duplicates
+    while not stopping["v"]:
+        r, _, _ = select.select([w.fd], [], [], 1.0)
+        batch = []
+        if r:
+            for path, pid, pidfd, dev, ino in w.read_events():
+                root = w._interesting(path)
+                if root is None and ino < 0:
+                    if pidfd >= 0:
+                        with contextlib.suppress(OSError):
+                            os.close(pidfd)
+                    continue
+                uid, loginuid, comm = _proc_identity(pid)
+                if pidfd >= 0:
+                    with contextlib.suppress(OSError):
+                        os.close(pidfd)
+                if uid < 0:
+                    continue
+                ts = int(time.time())
+                key = (path, pid, uid)
+                if seen.get(key) == ts:
+                    continue                 # same write, duplicate event
+                seen[key] = ts
+                batch.append((ts, path, dev, ino, 1 if root else 0,
+                              uid, loginuid, pid, comm))
+        if batch:
+            for r in {w._interesting(b[1]) for b in batch}:
+                if r:
+                    enforced.pop(r, None)
+                    with contextlib.suppress(Exception):
+                        _enforce_repo_access(r)
+            db.executemany(
+                "INSERT INTO events(ts,path,dev,ino,in_repo,uid,loginuid,"
+                "pid,comm) VALUES(?,?,?,?,?,?,?,?,?)", batch)
+            db.commit()
+        nowf = time.time()
+        if nowf - last_beat >= HEARTBEAT_SEC:
+            db.execute("UPDATE coverage SET last_seen=? WHERE id=?",
+                       (nowf, cov_id))
+            db.commit()
+            last_beat = nowf
+            if len(seen) > 4096:
+                seen.clear()
+        if nowf - last_reload >= 3:
+            reload_roots()
+            # re-apply access only where something actually changed. the
+            # loop is single-threaded: walking every repository every few
+            # seconds would starve event capture, and a missed event is a
+            # change nobody can be held to
+            for r in w.roots:
+                try:
+                    m = os.stat(Path(r) / SB_DIR / DB_NAME).st_mtime_ns
+                except OSError:
+                    continue
+                if enforced.get(r) == m:
+                    continue
+                enforced[r] = m
+                with contextlib.suppress(Exception):
+                    _enforce_repo_access(r)
+            last_reload = nowf
+        if nowf - last_prune >= 60:
+            db.execute("DELETE FROM events WHERE in_repo=0 AND ts < ?",
+                       (int(nowf) - 300,))
+            db.execute("DELETE FROM events WHERE ts < ?",
+                       (int(nowf) - EVENT_RETAIN,))
+            db.execute("DELETE FROM coverage WHERE last_seen < ?",
+                       (int(nowf) - EVENT_RETAIN,))
+            db.commit()
+            last_prune = nowf
+    db.execute("UPDATE coverage SET last_seen=?, closed=1 WHERE id=?",
+               (time.time(), cov_id))
+    db.commit()
+    w.close()
+    with contextlib.suppress(OSError):
+        PIDFILE.unlink()
+    with contextlib.suppress(OSError):
+        os.close(lock_fd)
+    return 0
+
+# --- what sb asks the store ---------------------------------------------
+def service_running():
+    db = events_db()
+    if db is None:
+        return False
+    try:
+        # only an *open* window means it is still running. a closed one was
+        # shut down cleanly, and reporting it as alive for the length of the
+        # grace period would tell the person the opposite of the truth
+        row = db.execute("SELECT MAX(last_seen) FROM coverage "
+                         "WHERE closed=0").fetchone()
+    except sqlite3.Error:
+        return False
+    return bool(row and row[0] and
+                time.time() - float(row[0]) <= GAP_GRACE_SEC)
+
+def service_installed():
+    return EVENTS_DB.exists()
+
+def register_repo(root):
+    # a small file per repository, named by a hash of its path so two users
+    # registering the same tree do not collide
+    if not REPOS_DIR.is_dir():
+        return False
+    full = str(Path(root).resolve())
+    tag = hashlib.sha256(full.encode()).hexdigest()[:16]
+    f = REPOS_DIR / tag
+    try:
+        if f.exists():
+            return True
+        tmp = REPOS_DIR / f".{tag}.{os.getpid()}"
+        tmp.write_text(full + "\n")
+        with contextlib.suppress(OSError):
+            os.chmod(tmp, 0o644)
+        os.replace(tmp, f)
+        return True
+    except OSError:
+        return False
+
+def repo_is_registered(root):
+    tag = hashlib.sha256(str(Path(root).resolve()).encode()).hexdigest()[:16]
+    return (REPOS_DIR / tag).exists()
+
+def registered_repos():
+    # only paths that really are repositories are watched, so a stray or
+    # mischievous entry cannot make the watcher mark an unrelated mount
+    out = []
+    if not REPOS_DIR.is_dir():
+        return out
+    try:
+        names = sorted(os.listdir(REPOS_DIR))[:MAX_REPOS]
+    except OSError:
+        return out
+    for n in names:
+        if n.startswith("."):
+            continue
+        try:
+            root = (REPOS_DIR / n).read_text().strip()
+        except OSError:
+            continue
+        if root and (Path(root) / SB_DIR / DB_NAME).is_file():
+            out.append(root)
+    return out
+
+def covered_at(db, ts):
+    # was the watcher demonstrably running at this moment?
+    try:
+        row = db.execute(
+            "SELECT 1 FROM coverage WHERE started<=? AND ("
+            "  (closed=0 AND last_seen+?>=?) OR (closed=1 AND last_seen>?)"
+            ") LIMIT 1", (ts, GAP_GRACE_SEC, ts, ts)).fetchone()
+    except sqlite3.Error:
+        return False
+    return row is not None
+
+def writer_of(root, rel, since=0):
+    # (uid, loginuid, covered). uid is None when nothing was recorded.
+    # covered says whether the watcher was running when the file last
+    # changed — so an unobserved change is reported, never guessed
+    db = events_db()
+    if db is None:
+        return None, -1, False
+    full = str((Path(root) / rel).resolve())
+    dev = ino = -1
+    try:
+        st = os.lstat(full)
+        mtime, dev, ino = st.st_mtime, st.st_dev, st.st_ino
+    except OSError:
+        mtime = time.time()
+    try:
+        covered = covered_at(db, mtime)
+        # an event only explains *this* change if it happened when the
+        # change did. the newest event for an inode may predate an outage,
+        # and attributing a later edit to it would credit the wrong person
+        floor = max(since, int(mtime) - EVENT_SKEW_SEC)
+        row = None
+        if ino >= 0:
+            # the inode is the strongest match: it identifies these exact
+            # bytes whether they were written in place or renamed into
+            # position from a temp file somewhere else
+            row = db.execute(
+                "SELECT uid, loginuid FROM events WHERE dev=? AND ino=? "
+                "AND ts>=? ORDER BY ts DESC LIMIT 1",
+                (dev, ino, floor)).fetchone()
+        if row is None:
+            row = db.execute(
+                "SELECT uid, loginuid FROM events WHERE path=? AND ts>=? "
+                "ORDER BY ts DESC LIMIT 1", (full, floor)).fetchone()
+    except sqlite3.Error:
+        return None, -1, False
+    if row is None:
+        return None, -1, covered
+    return int(row[0]), int(row[1]), covered
+
+# === repo membership ===
+# a repository has a creator (whoever ran init) and a roster of OS accounts
+# allowed to work in it. membership is what grants write access to an
+# unlocked file; a lock narrows that to one person for as long as it lasts.
+ROSTER_KEY, CREATOR_KEY = "roster", "creator_uid"
+
+def repo_creator(repo):
+    v = repo.meta(CREATOR_KEY)
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+def repo_roster(repo):
+    # uids allowed in this repository, creator always included
+    out = []
+    v = repo.meta(ROSTER_KEY)
+    if v:
+        try:
+            out = [int(u) for u in json.loads(v)]
+        except (ValueError, TypeError):
+            out = []
+    c = repo_creator(repo)
+    if c is not None and c not in out:
+        out.insert(0, c)
+    return out
+
+def set_roster(repo, uids):
+    c = repo_creator(repo)
+    keep = [u for u in dict.fromkeys(int(u) for u in uids) if u != c]
+    repo.set_meta(ROSTER_KEY, json.dumps(keep))
+
+# --- POSIX ACLs, written directly ---------------------------------------
+# "these specific accounts may write this file" is not something mode bits
+# can say. it is exactly what a POSIX ACL says, so sb writes one. the xattr
+# format is small and stable, so this needs no acl package and no setfacl
+# binary: the no-dependencies promise survives.
+_ACL_XATTR = "system.posix_acl_access"
+_ACL_USER_OBJ, _ACL_USER, _ACL_GROUP_OBJ, _ACL_MASK, _ACL_OTHER = (
+    0x01, 0x02, 0x04, 0x10, 0x20)
+_ACL_R, _ACL_W, _ACL_X = 4, 2, 1
+_ACL_UNDEF = 0xFFFFFFFF
+
+def _acl_blob(named_uids, execable=False):
+    # owner rw(x), each named account rw(x), group and other read only
+    import struct
+    x = _ACL_X if execable else 0
+    ents = [(_ACL_USER_OBJ, _ACL_R | _ACL_W | x, _ACL_UNDEF)]
+    ents += [(_ACL_USER, _ACL_R | _ACL_W | x, u) for u in sorted(set(named_uids))]
+    ents.append((_ACL_GROUP_OBJ, _ACL_R | x, _ACL_UNDEF))
+    if named_uids:
+        ents.append((_ACL_MASK, _ACL_R | _ACL_W | x, _ACL_UNDEF))
+    ents.append((_ACL_OTHER, _ACL_R | x, _ACL_UNDEF))
+    return struct.pack("<I", 2) + b"".join(
+        struct.pack("<HHI", t, perm, i) for t, perm, i in ents)
+
+def _acl_apply(path, named_uids, execable=False):
+    try:
+        os.setxattr(str(path), _ACL_XATTR, _acl_blob(named_uids, execable))
+        return True
+    except (OSError, AttributeError, NotImplementedError):
+        return False        # no ACL support here; mode bits still apply
+
+def set_file_access(repo, rel, holder_uid=None, roster=None, creator=None):
+    # the access rule, in one place:
+    #   locked   -> the holder owns it, and only the holder may write
+    #   unlocked -> the creator owns it, and every roster member may write
+    full = repo.root / rel
+    try:
+        st = os.lstat(full)
+    except OSError:
+        return False
+    if stat.S_ISLNK(st.st_mode):
+        return False                        # a link carries no access of its own
+    if roster is None:
+        roster = repo_roster(repo)
+    if creator is None:
+        creator = repo_creator(repo)
+    if holder_uid is not None and holder_uid >= 0:
+        own, writers = holder_uid, [holder_uid]
+    else:
+        own, writers = creator, list(roster)
+    execable = bool(st.st_mode & 0o100)
+    _chmod_quiet(full, 0o644 | (0o111 if execable else 0))
+    _acl_apply(full, [w for w in writers if w is not None and w != own],
+               execable)
+    if own is not None:
+        _chown_quiet(full, own)
+    return True
+
+def set_dir_access(repo, rel, roster, creator):
+    # replacing a file needs write on its *directory*, not on the file. an
+    # editor that saves by write-temp-then-rename cannot save at all unless
+    # roster members can write the containing directory — and that rename
+    # is also the only moment the OS records who wrote the new file
+    full = repo.root / rel if rel else repo.root
+    try:
+        st = os.lstat(full)
+    except OSError:
+        return
+    if not stat.S_ISDIR(st.st_mode):
+        return
+    _chmod_quiet(full, 0o755)
+    _acl_apply(full, [u for u in roster if u is not None and u != creator],
+               execable=True)
+    if creator is not None:
+        _chown_quiet(full, creator)
+
+def apply_repo_access(repo, paths=None):
+    # re-assert the rule across the repository. cheap for the locked set,
+    # which is what every command needs; a full pass happens on membership
+    # changes and after a save releases locks
+    locks = repo.locks()
+    roster, creator = repo_roster(repo), repo_creator(repo)
+    if paths is None:
+        tree, _ = head_tree_files(repo)
+        paths = set(tree) | set(locks)
+    dirs = {""}
+    for rel in sorted(paths):
+        l = locks.get(rel)
+        set_file_access(repo, rel, l["uid"] if l else None, roster, creator)
+        parts = rel.split("/")[:-1]
+        for i in range(len(parts)):
+            dirs.add("/".join(parts[:i + 1]))
+    for d in sorted(dirs):
+        set_dir_access(repo, d, roster, creator)
+
+def lock_is_mine(lock, my_uids=None, _unused=None):
+    # a lock belongs to an OS account. that is the only question, and the
+    # file system answers it the same way sb does
     if my_uids is None:
         my_uids = _my_uids()
-    if my_email is None:
-        _, my_email = author()
     uid = lock.get("uid", -1)
-    if uid is not None and uid >= 0:
-        return uid in my_uids or lock["email"] == my_email
-    return lock["email"] == my_email
+    return uid is not None and uid >= 0 and uid in my_uids
 
 def foreign_locks(repo):
     # paths locked by someone else. never overwritten by a checkout, never
     # counted as my unsaved changes, never included in my saves
-    my_uids, (_, my_email) = _my_uids(), author()
+    my_uids = _my_uids()
     return {p for p, l in repo.locks().items()
-            if not lock_is_mine(l, my_uids, my_email)}
+            if not lock_is_mine(l, my_uids)}
 
 def _disk_state(repo, rel):
     # (mode, hash, data, st) for a path. anything but a plain file is absent
@@ -1683,22 +2462,12 @@ def _disk_state(repo, rel):
     return mode, hash_obj("blob", data), data, st
 
 def _lock_actor(repo, lock, st):
-    # who most likely changed a locked file. the owner uid wins when it can
-    # tell the two people apart, since a file owned by another account was
-    # written by it. otherwise fall back to whoever is running sb
-    _, me_email = author()
+    # which account wrote what is on disk now. the file's owner uid says so
+    # directly; with no owner signal (a deletion) it is whoever ran sb
     uid = getattr(st, "st_uid", None) if st is not None else None
-    if uid is not None and lock.get("uid", -1) >= 0:
-        if uid in _my_uids():
-            # my login account, or root because sb itself wrote it while
-            # elevated. either way the person who typed the edit is me
-            return me_email
-        if uid != lock["uid"]:
-            return _uid_identity(repo, uid)[1]        # another account
-        registered = _uid_identity(repo, uid)[1]
-        if registered == lock["email"] or me_email == lock["email"]:
-            return lock["email"]        # the account really is the holder's
-    return me_email
+    if uid is not None:
+        return uid
+    return _my_uid()
 
 def enforce_locks(repo, quiet=False):
     # keep every locked file equal to its holder's version. against the
@@ -1724,7 +2493,8 @@ def enforce_locks(repo, quiet=False):
         else:
             held = None if l["held"] == LOCK_DELETED else (l["mode"], l["held"])
             if cur != held:
-                if _lock_actor(repo, l, st) == l["email"]:
+                if _lock_actor(repo, l, st) in _my_uids() \
+                        and lock_is_mine(l):
                     new_h = repo.put("blob", data) if cur else LOCK_DELETED
                     repo.update_lock_held(rel, new_h, mode or "100644")
                     held = cur
@@ -1775,7 +2545,6 @@ def process_lock_expiry(repo):
     # disk would destroy the only copy of a live credential. secrets are
     # reported and flagged, and a file differing only by an already redacted
     # secret is skipped
-    register_identity(repo)
     now = int(time.time())
     expired = [(p, l) for p, l in repo.locks().items()
                if now - l["since"] >= LOCK_TTL]
@@ -1788,8 +2557,9 @@ def process_lock_expiry(repo):
     # group by owner: one save + one revert each, attributed to them
     by_owner = {}
     for p, l in expired:
-        by_owner.setdefault((l["owner"], l["email"]), []).append(p)
-    for (owner, email), paths in by_owner.items():
+        by_owner.setdefault(l.get("uid", -1), []).append(p)
+    for owner_uid, paths in by_owner.items():
+        owner = uid_name(owner_uid)
         changed = [p for p in paths
                    if work.get(p) != tree_files.get(p)
                    and not _only_redaction_differs(repo, tree_files, work, p)]
@@ -1801,7 +2571,7 @@ def process_lock_expiry(repo):
         extra = {"secrets_present": secretish} if secretish else None
         h1 = _commit_subset(repo, work, tree_files, head_c, changed,
                             f"auto-save: {owner}'s expired lock(s)",
-                            owner=owner, email=email, op="autosave",
+                            owner=owner, op="autosave",
                             extra=extra)
         tree_files, head_c = head_tree_files(repo)  # refresh after commit
         # back to the content before the edits. a path that did not exist
@@ -1810,7 +2580,7 @@ def process_lock_expiry(repo):
         _commit_subset(repo, revert_work, tree_files, head_c, changed,
                        f"auto-revert: {owner}'s expired edits "
                        f"(bring them back: sb restore {short(h1)})",
-                       owner=owner, email=email, op="autosave")
+                       owner=owner, op="autosave")
         tree_files, head_c = head_tree_files(repo)
         # and put that content back on disk
         _restore_paths_on_disk(repo, prior)
@@ -1837,8 +2607,7 @@ def acquire_locks_for_edits(repo, quiet=False):
     #
     # attribution goes by the file's owner uid, so Bob running 'sb status'
     # over Alice's edit creates the lock in her name
-    register_identity(repo)
-    name, email = author()
+    name = author()
     me_uid = _my_uid()
     me_uids = _my_uids()
     work = snapshot_worktree(repo, write=True)
@@ -1847,96 +2616,69 @@ def acquire_locks_for_edits(repo, quiet=False):
     edited = set(a) | set(m) | set(d)
     edited -= redaction_only_paths(repo, tree_files, work, edited)
     locks = repo.locks()
-    # unlocked edits, grouped by the file's owner on disk
-    mine_new, theirs = [], {}
+    # unlocked edits, grouped by the account that owns the file on disk
+    mine_new, theirs, unknown = [], {}, []
     for p in edited:
         if p in locks:
             continue
-        owner_uid = None
-        if me_uid is not None and p in work:      # deletions: nothing to stat
-            try:
-                owner_uid = os.lstat(repo.root / p).st_uid
-            except OSError:
-                pass
-        # a uid that is not mine still isn't someone else if it resolves to
-        # my own identity. attribution exists to tell two people apart, so
-        # it must never split one person into two
-        if (owner_uid is None or owner_uid in me_uids
-                or _uid_identity(repo, owner_uid)[1] == email):
+        owner_uid, unattributed = None, False
+        if p in work:                             # deletions: nothing to stat
+            # the watcher saw the write and recorded the account that made
+            # it. that is a fact, not an inference, and it is right even for
+            # an in-place edit that left ownership untouched
+            wuid, _luid, covered = writer_of(repo.root, p)
+            if wuid is not None:
+                owner_uid = wuid
+            elif not covered:
+                unattributed = True               # nothing was watching
+            if owner_uid is None and me_uid is not None:
+                try:
+                    owner_uid = os.lstat(repo.root / p).st_uid
+                except OSError:
+                    pass
+        if unattributed:
+            unknown.append(p)
+        elif owner_uid is None or owner_uid in me_uids:
             mine_new.append(p)
         else:
             theirs.setdefault(owner_uid, []).append(p)
+    if not service_running() and (mine_new or theirs or unknown):
+        tree_print([yellow("the write-attribution watcher is not running")])
+        leaf(dim("changes cannot be attributed to an account while it is "
+                 "stopped — sudo sb service -i"))
+    if unknown:      # a safety signal: never suppressed by quiet mode
+        tree_print([f"{cyan(p)} " + yellow("changed while nothing was "
+                    "watching") for p in sorted(unknown)])
+        leaf(dim("the watcher was not running, so sb cannot say who wrote "
+                 "these. they are left unlocked and unattributed — "
+                 "sudo sb service -s"))
     if mine_new or theirs:
         base = repo.head_commit() or ""
-        if mine_new:
-            for p in mine_new:
-                mode, h = work.get(p, ("100644", None))
-                repo.set_lock(p, name, email, base, held=h or LOCK_DELETED,
-                              mode=mode,
-                              uid=-1 if me_uid is None else me_uid,
-                              perm=lock_perms_on(repo, p))
-            if not quiet:
-                tree_print([f"locked {cyan(p)} " + dim("(your version wins "
-                            "until you save)") for p in sorted(mine_new)])
+        for p in mine_new:
+            mode, h = work.get(p, ("100644", None))
+            repo.set_lock(p, name, base, held=h or LOCK_DELETED, mode=mode,
+                          uid=-1 if me_uid is None else me_uid,
+                          perm=lock_perms_on(repo, p))
+            set_file_access(repo, p, me_uid)
+        if mine_new and not quiet:
+            tree_print([f"locked {cyan(p)} " + dim("(your version wins "
+                        "until you save)") for p in sorted(mine_new)])
         for uid, paths in sorted(theirs.items()):
-            o_name, o_email = _uid_identity(repo, uid)
+            o_name = uid_name(uid)
             for p in sorted(paths):
                 mode, h = work.get(p, ("100644", None))
-                repo.set_lock(p, o_name, o_email, base,
-                              held=h or LOCK_DELETED, mode=mode, uid=uid,
-                              perm=lock_perms_on(repo, p))
+                repo.set_lock(p, o_name, base, held=h or LOCK_DELETED,
+                              mode=mode, uid=uid, perm=lock_perms_on(repo, p))
+                set_file_access(repo, p, uid)
             if not quiet:
                 tree_print([f"locked {cyan(p)} to {bold(o_name)} "
                             + dim("(their on-disk edit)")
                             for p in sorted(paths)])
 
-def reconcile_lock_identity(repo, quiet=False):
-    # repair locks that an earlier run filed under an identity sb invented.
-    #
-    # when a uid has never run sb, _uid_identity falls back to the system
-    # account name and a synthetic '<name>@uid<N>' email. that is right for
-    # a teammate who has never used sb, and wrong for you: a lock carrying
-    # the synthetic email for an account that is yours is not another
-    # person, it is you under a name sb made up, and it will keep every one
-    # of your saves from committing that file. adopt those, and only those.
-    #
-    # a real registered identity on one of my accounts is left alone: that
-    # is the shared-login case, where the other holder genuinely is someone
-    # else.
-    mine_uids = _my_uids()
-    name, email = author()
-    adopted = []
-    for rel, l in sorted(repo.locks().items()):
-        uid = l.get("uid", -1)
-        if uid < 0 or uid not in mine_uids or l["email"] == email:
-            continue
-        if l["email"] != f"{l['owner']}@uid{uid}":
-            continue                    # a real identity, not an invented one
-        registered = repo.meta(f"uid:{uid}")
-        if registered:
-            try:
-                if json.loads(registered)[1] == l["email"]:
-                    continue            # invented once, since registered
-            except (ValueError, TypeError, IndexError):
-                pass
-        repo.update_lock_owner(rel, name, email, uid)
-        adopted.append(rel)
-    if adopted:
-        with contextlib.suppress(sqlite3.Error):
-            repo.journal("lock-adopt", {"paths": adopted, "to": email,
-                                        "uids": sorted(mine_uids)})
-        if not quiet:
-            tree_print([f"lock on {cyan(p)} " + dim("was filed under an "
-                        "invented identity for your own account — it is "
-                        "yours") for p in adopted])
-    return adopted
-
 def sync_locks(repo, quiet=False):
     # the whole lifecycle, in the only order that keeps content honest:
     # register who I am, adopt locks wrongly filed as someone else's, then
     # enforce, expire, and claim. every command touching state runs it
-    register_identity(repo)
-    reconcile_lock_identity(repo, quiet=quiet)
     enforce_locks(repo, quiet=quiet)
     process_lock_expiry(repo)
     acquire_locks_for_edits(repo, quiet=quiet)
@@ -1949,7 +2691,7 @@ def _ago(ts):
     return f"{s//3600}h{(s%3600)//60}m ago"
 
 def _commit_subset(repo, work, tree_files, head_c, subset, message,
-                   *, owner=None, email=None, op="save", extra=None,
+                   *, owner=None, op="save", extra=None,
                    verify_drift=False, disk_ref=None, extra_parents=()):
     # commit a tree equal to the last one with only subset replaced by its
     # work version. this is how my save leaves everyone else's edits alone.
@@ -1991,7 +2733,7 @@ def _commit_subset(repo, work, tree_files, head_c, subset, message,
         parents = ([head_c["hash"]] if head_c else []) + list(extra_parents)
         if owner:
             c = {"tree": tree_hash, "parents": parents, "author": owner,
-                 "email": email, "time": int(time.time()), "message": message}
+                 "time": int(time.time()), "message": message}
             h = repo.put("commit", canonical(c))
         else:
             h = make_commit(repo, tree_hash, parents, message)
@@ -2228,12 +2970,28 @@ def cmd_init(args):
     root = Path(".").resolve()
     if (root / SB_DIR).exists():
         die("repository already exists here")
+    if not service_installed():
+        die("the write-attribution watcher is not installed.\n"
+            "       sandbox needs it to know which account wrote each file;\n"
+            "       without it, an in-place edit cannot be attributed at all.\n"
+            "       install it once per machine:  sudo sb service -i")
+    if not service_running():
+        die("the write-attribution watcher is installed but not running.\n"
+            "       start it:  sudo sb service -i   ·  check:  sb service -s")
     repo = Repo(root, create=True)
-    name, email = author()
+    name = author()
+    me = _my_uid()
+    if me is not None:
+        with repo.transaction():
+            repo.set_meta(CREATOR_KEY, me)
+            repo.set_meta(ROSTER_KEY, json.dumps([]))
+            repo.journal("useradd", {"user": name, "uid": me,
+                                     "by": name, "creator": True})
+    register_repo(root)
     print(f"initialized sandbox on branch {bold('main')}")
     tree_print([
         dim("store   ") + str(repo.vdir / DB_NAME),
-        dim("author  ") + f"{name} <{email}>  " + dim("(change: sb who <name> <email>)"),
+        dim("creator ") + f"{name}  " + dim("(add others: sb useradd <linux-user>)"),
     ])
 
 def cmd_status(args):
@@ -2249,7 +3007,7 @@ def cmd_status(args):
     print(f"on branch {bold(repo.current_branch())}"
           + (f" {dim('·')} head {amber(short(head))}" if head
              else dim("  (no saves yet)")))
-    name, email = author()
+    name = author()
     locks = repo.locks()
     if locks:
         rows = []
@@ -2351,7 +3109,9 @@ def cmd_save(args):
         if mstate:
             repo.set_meta(MERGE_STATE, "")
         # everyone's edits are in the commit, so no lock is left to protect
-        release_locks(repo, list(repo.locks().keys()))
+        freed_all = list(repo.locks().keys())
+        release_locks(repo, freed_all)
+        apply_repo_access(repo, freed_all)
     n = len(added) + len(modified) + len(deleted)
     print(f"{bold('saved')} {amber(short(h))} "
           f"{dim('on')} {bold(repo.current_branch())} {dim('·')} {dim(str(n) + ' file(s)')}")
@@ -2376,7 +3136,7 @@ def _save_shared(repo, args):
     # same contract as the --global-force path: read the worktree once into
     # stored blobs, run redaction and gates and the commit from those, and
     # recheck disk before committing so drift aborts the save
-    name, email = author()
+    name = author()
     with repo.transaction():
         # one transaction, so an abort rolls the blobs back out
         disk = snapshot_worktree(repo, write=True)   # what's really on disk
@@ -2434,12 +3194,13 @@ def _save_shared(repo, args):
         # refuse if any of these changed on disk after the snapshot.
         # disk_ref is that snapshot, since work may hold redacted blobs
         h = _commit_subset(repo, work, tree_files, head_c, changed,
-                           args.message, owner=name, email=email,
+                           args.message, owner=name,
                            op="merge" if mstate else "save",
                            extra=bypass or None,
                            verify_drift=True, disk_ref=disk,
                            extra_parents=[theirs_tip] if theirs_tip else ())
         release_locks(repo, changed)
+        apply_repo_access(repo, changed)
         if mstate:
             repo.set_meta(MERGE_STATE, "")
     print(f"{bold('saved')} {amber(short(h))} "
@@ -2461,8 +3222,7 @@ def cmd_log(args):
     for c in walk_history(repo, head):
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(c["time"]))
         merge = dim("  (merge)") if len(c["parents"]) > 1 else ""
-        print(f"{amber(short(c['hash']))}  {dim(when)}  {c['author']} "
-              f"{dim('<' + c['email'] + '>')}{merge}")
+        print(f"{amber(short(c['hash']))}  {dim(when)}  {c['author']}{merge}")
         rows = c["message"].splitlines() or ['""']
         # what this save changed, relative to its first parent
         try:
@@ -2692,7 +3452,7 @@ def _create_branch(repo, branch, head, allow_secrets=False):
     # away. files someone else has locked come from the last save, not from
     # disk, and credentials are redacted as in any save. a current branch
     # with no saves is seeded with the same commit, so both share a base
-    name, email = author()
+    name = author()
     keep = foreign_locks(repo)
     seeded = None
     with repo.transaction():
@@ -2712,7 +3472,7 @@ def _create_branch(repo, branch, head, allow_secrets=False):
         work.update(over)
         tree_hash = build_tree(repo, work)
         c = {"tree": tree_hash, "parents": [head] if head else [],
-             "author": name, "email": email, "time": int(time.time()),
+             "author": name, "time": int(time.time()),
              "message": "Initial branch creation"}
         h = repo.put("commit", canonical(c))
         extra = {"initial": True}
@@ -2982,7 +3742,7 @@ def cmd_merge(args):
     # a merge that would change someone else's locked file is refused.
     # --ignore skips those: everything else merges, each skipped file keeps
     # our version, and its lock stays
-    name, email = author()
+    name = author()
     ignore_locked = getattr(args, "ignore", False)
     skip = set()
     theirs_tree_pre = read_tree(repo, parse_commit(repo, theirs_tip)["tree"])
@@ -3256,10 +4016,10 @@ def cmd_publish(args):
         if not args.no_verify:
             die("pre-publish tests failed — publish blocked (--no-verify to override)")
         print(yellow("tests failed but --no-verify given — proceeding"))
-    name, email = author()
+    name = author()
     record = {
         "commit": head, "branch": repo.current_branch(),
-        "label": args.label or "release", "author": f"{name} <{email}>",
+        "label": args.label or "release", "author": name,
         "tests": {"scripts": gate_scripts, "passed": tests_passed}}
     if args.no_verify:
         record["skipped_tests"] = True
@@ -3495,10 +4255,10 @@ def cmd_journal(args):
                        list(kept.values())[:3])) if kept else ""))
         elif e["op"] == "ignore":
             what = d.get("pattern", "")
-        elif e["op"] == "identity":
-            what = f"uid {d.get('uid','?')} → {d.get('name','?')} <{d.get('email','?')}>"
-            if d.get("cleared"):
-                what += dim(f"  · cleared stale {d['cleared']} mapping")
+        elif e["op"] in ("useradd", "userdel"):
+            what = (f"{d.get('user','?')} (uid {d.get('uid','?')})"
+                    + dim("  · " + ("added to" if e["op"] == "useradd"
+                                    else "removed from") + " the repository"))
         elif e["op"] == "lock-adopt":
             paths = d.get("paths", [])
             what = (", ".join(paths[:3]) + (" …" if len(paths) > 3 else "")
@@ -3524,7 +4284,7 @@ def cmd_info(args):
     raw = repo.db.execute("SELECT COALESCE(SUM(size),0) FROM objects").fetchone()[0]
     db_size = (repo.vdir / DB_NAME).stat().st_size
     n_journal = repo.db.execute("SELECT COUNT(*) FROM journal").fetchone()[0]
-    name, email = author()
+    name = author()
     print(f"{dim('repository')} {bold(str(repo.root))}")
     tree_print([
         f"version  sandbox {VERSION}  " + dim(f"· {AUTHOR}"),
@@ -3538,7 +4298,7 @@ def cmd_info(args):
         + amber(repo.chain_head()[:16]),
         f"locks    {len(repo.locks())} active  "
         + dim("(sb locks)"),
-        f"you      {name} <{email}>  "
+        f"you      {name}  "
         + dim("(attribution only — no keys, no signatures)"),
     ])
 
@@ -3568,7 +4328,7 @@ def cmd_locks(args):
     locks = repo.locks()
     if not locks:
         print(dim("no active locks")); return
-    name, email = author()
+    name = author()
     print(f"{len(locks)} active lock(s)")
     rows = []
     for p in sorted(locks):
@@ -3590,8 +4350,9 @@ def cmd_locks(args):
 def cmd_unlock(args):
     repo = need_repo()
     sync_locks(repo, quiet=True)
-    name, email = author()
+    name = author()
     force = getattr(args, "force", False)
+    my_uid = _my_uid()
     locks = repo.locks()
     targets = list(args.paths) if args.paths else \
         [p for p, l in locks.items() if force or lock_is_mine(l)]
@@ -3609,22 +4370,236 @@ def cmd_unlock(args):
             freed.append(p)
         else:
             denied.append(p)
+    took = []
     if freed:
         with repo.transaction():        # release + journal: one transaction
             owners = sorted({locks[p]["owner"] for p in freed})
             release_locks(repo, freed)
+            # taking someone else's lock has to move the file with it.
+            # ownership is what the next scan reads to decide who edited a
+            # path, so releasing the row alone would let that scan hand the
+            # lock straight back to the account that owns the file, and the
+            # force would do nothing at all
+            if force and my_uid is not None:
+                for p in sorted(freed):
+                    if not lock_is_mine(locks[p]) and \
+                            lock_own_to_holder(repo, p, my_uid):
+                        took.append(p)
             repo.journal("unlock", {"paths": sorted(freed), "forced": force,
-                                    "owners": owners, "by": name})
+                                    "owners": owners, "by": name,
+                                    **({"took_ownership": took} if took
+                                       else {})})
     if freed:
         print(f"unlocked {len(freed)} file(s)" + (dim(" (forced)") if force else ""))
         tree_print([cyan(p) for p in sorted(freed)])
-        leaf(dim("their content stays on disk — whoever edits next takes "
-                 "the lock"))
+        if took:
+            leaf(dim(f"{len(took)} file(s) now owned by {name} on disk — "
+                     "your next edit takes the lock"))
+        else:
+            leaf(dim("their content stays on disk — whoever edits next takes "
+                     "the lock"))
     if missing:
         leaf(dim(f"{len(missing)} not locked: " + ", ".join(sorted(missing)[:4])))
     if denied:
         die(f"{len(denied)} held by others — 'sb unlock <path> --force' "
             f"releases them: " + ", ".join(sorted(denied)[:4]))
+
+def _systemd_available():
+    return Path("/run/systemd/system").is_dir() and shutil.which("systemctl")
+
+def _unit_text():
+    exe = os.path.realpath(sys.argv[0])
+    py = sys.executable or "/usr/bin/python3"
+    return f"""[Unit]
+Description=sandbox write-attribution watcher
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart={py} {exe} service --run
+Restart=always
+RestartSec=2
+Nice=5
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+def _spawn_detached():
+    # no systemd: run the watcher as a plain background process so the
+    # tool still works, rather than silently having no attribution
+    py = sys.executable or "/usr/bin/python3"
+    exe = os.path.realpath(sys.argv[0])
+    log = SERVICE_DIR / "watch.log"
+    SERVICE_DIR.mkdir(parents=True, exist_ok=True)
+    fh = open(log, "ab")
+    proc = subprocess.Popen([py, exe, "service", "--run"],
+                            stdout=fh, stderr=fh, stdin=subprocess.DEVNULL,
+                            start_new_session=True)
+    return proc.pid
+
+def _watcher_pid():
+    return watcher_locked_by()
+
+def _stop_all_watchers(timeout=12.0):
+    # signal whoever holds the lock, and keep going until it is free, so a
+    # straggler from an earlier start cannot survive a stop
+    end = time.time() + timeout
+    while time.time() < end:
+        pid = watcher_locked_by()
+        if pid is None:
+            return True
+        if pid and pid > 0:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGTERM)
+        time.sleep(0.25)
+    pid = watcher_locked_by()
+    if pid and pid > 0:
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
+        time.sleep(0.5)
+    return watcher_locked_by() is None
+
+def cmd_service(args):
+    if getattr(args, "run", False):
+        sys.exit(watcher_main())
+    if args.kill:
+        if _systemd_available() and UNIT_PATH.exists():
+            subprocess.run(["systemctl", "stop", SERVICE_UNIT],
+                           capture_output=True)
+        ok = _stop_all_watchers()
+        for _ in range(40):
+            if not service_running():
+                break
+            time.sleep(0.1)
+        print("watcher stopped" if ok
+              else red("could not stop the watcher — check 'sb service -s'"))
+        leaf(dim("changes made while it is stopped cannot be attributed — "
+                 "sb will say so rather than guess"))
+        return
+    if args.status:
+        inst, run = service_installed(), service_running()
+        print(("watcher " + (green("running") if run else red("not running")))
+              if inst else red("not installed"))
+        rows = []
+        if inst:
+            db = events_db()
+            if db is not None:
+                n = db.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+                last = db.execute("SELECT MAX(last_seen) FROM coverage").fetchone()[0]
+                repos = registered_repos()
+                rows.append(dim("store    ") + str(EVENTS_DB))
+                rows.append(dim("events   ") + f"{n} recorded")
+                rows.append(dim("heartbeat") + " " + (
+                    f"{int(time.time() - float(last))}s ago" if last
+                    else "never"))
+                rows.append(dim("repos    ") + (f"{len(repos)} registered"
+                                                if repos else "none"))
+                for r in repos[:8]:
+                    rows.append(dim("  · ") + r)
+        pid = _watcher_pid()
+        if pid:
+            rows.append(dim("pid      ") + str(pid))
+        tree_print(rows or [dim("run 'sudo sb service -i' to install it")])
+        if inst and not run:
+            leaf(yellow("attribution is not being recorded right now"))
+        return
+    # -i: install, or bring it back if it was killed
+    if os.geteuid() != 0:
+        die("installing the watcher needs root:  sudo sb service -i")
+    db = events_db(create=True)
+    if db is None:
+        die(f"cannot create the event store at {EVENTS_DB}")
+    db.close()
+    if _systemd_available():
+        _stop_all_watchers()
+        UNIT_PATH.write_text(_unit_text())
+        subprocess.run(["systemctl", "daemon-reload"], capture_output=True)
+        subprocess.run(["systemctl", "enable", SERVICE_UNIT], capture_output=True)
+        subprocess.run(["systemctl", "restart", SERVICE_UNIT], capture_output=True)
+        how = "systemd unit " + SERVICE_UNIT
+    else:
+        _stop_all_watchers()
+        _spawn_detached()
+        how = "background process (no systemd here)"
+    for _ in range(50):
+        if service_running():
+            break
+        time.sleep(0.1)
+    if not service_running():
+        die("the watcher did not come up — check 'sudo sb service -s'\n"
+            f"       log: {SERVICE_DIR / 'watch.log'}")
+    print("write-attribution watcher " + green("running"))
+    tree_print([dim("via      ") + how,
+                dim("store    ") + str(EVENTS_DB),
+                dim("watching ") + "every registered repository"])
+    leaf(dim("it records which account wrote each file. 'sb init' needs it; "
+             "existing repositories pick it up automatically"))
+
+def cmd_useradd(args):
+    # add a linux account to this repository. membership is what grants
+    # write access to unlocked files, so this is also an access change
+    repo = need_repo()
+    if not args.user:
+        die("which account? usage:  sb useradd <linux-user>")
+    uid = name_uid(args.user)
+    if uid is None:
+        die(f"no such system account: {args.user}\n"
+            f"       sb works with real linux users; create it first")
+    roster = repo_roster(repo)
+    if uid in roster:
+        print(dim(f"{args.user} is already in this repository")); return
+    with repo.transaction():
+        set_roster(repo, roster + [uid])
+        repo.journal("useradd", {"user": args.user, "uid": uid,
+                                 "by": author()})
+    apply_repo_access(repo)
+    print(f"added {bold(args.user)} " + dim(f"(uid {uid})"))
+    leaf(dim("they may now edit any unlocked file; editing one locks it to "
+             "them until they save"))
+
+def cmd_userdel(args):
+    repo = need_repo()
+    if not args.user:
+        die("which account? usage:  sb userdel <linux-user>")
+    uid = name_uid(args.user)
+    creator = repo_creator(repo)
+    if uid is not None and uid == creator:
+        die("the creator cannot be removed — they own every unlocked file")
+    roster = repo_roster(repo)
+    if uid is None or uid not in roster:
+        die(f"{args.user} is not in this repository")
+    with repo.transaction():
+        set_roster(repo, [u for u in roster if u != uid])
+        repo.journal("userdel", {"user": args.user, "uid": uid,
+                                 "by": author()})
+    apply_repo_access(repo)
+    print(f"removed {bold(args.user)} " + dim(f"(uid {uid})"))
+    held = sorted(p for p, l in repo.locks().items() if l.get("uid") == uid)
+    if held:
+        leaf(dim(f"they still hold {len(held)} lock(s): "
+                 + ", ".join(held[:4])
+                 + " · release with sb unlock <path> --force"))
+
+def cmd_users(args):
+    repo = need_repo()
+    creator = repo_creator(repo)
+    roster = repo_roster(repo)
+    locks = repo.locks()
+    me = _my_uid()
+    print(f"{len(roster)} account(s) in this repository")
+    rows = []
+    for uid in roster:
+        held = sum(1 for l in locks.values() if l.get("uid") == uid)
+        note = []
+        if uid == creator: note.append("creator · owns unlocked files")
+        if uid == me:      note.append("you")
+        if held:           note.append(f"holding {held} lock(s)")
+        rows.append(f"{bold(uid_name(uid))} " + dim(f"(uid {uid})")
+                    + (dim("  · " + " · ".join(note)) if note else ""))
+    tree_print(rows)
+    leaf(dim("add: sb useradd <linux-user>  ·  remove: sb userdel <linux-user>"))
 
 def cmd_salvage(args):
     # write any stored content back out to a file. mainly the other half of
@@ -3652,27 +4627,6 @@ def cmd_salvage(args):
     print(f"{bold('salvaged')} {amber(short(full))} {dim('→')} "
           f"{cyan(str(dest))} " + dim(f"({len(data):,} bytes)"))
 
-def cmd_who(args):
-    if args.name:
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        prof = {"name": args.name}
-        if args.email:
-            prof["email"] = args.email
-        CONFIG_FILE.write_text(json.dumps(prof, indent=2))
-        try:
-            os.chmod(CONFIG_FILE, 0o600)
-        except OSError:
-            pass
-        # written under sudo it would be a root owned file in someone's
-        # home, which they could no longer update
-        su = _sudo_user()
-        if su and not os.environ.get("SB_HOME"):
-            for target in (CONFIG_FILE, CONFIG_DIR):
-                with contextlib.suppress(OSError):
-                    os.chown(target, su[0], su[1])
-    name, email = author()
-    print(f"saves are recorded as {bold(name)} <{email}>")
-    leaf(dim(f"config {CONFIG_FILE}  ·  env SB_NAME / SB_EMAIL override"))
 
 def cmd_ignore(args):
     repo = need_repo()
@@ -4185,7 +5139,7 @@ def cmd_pack(args):
               "will NOT be included — pack seals saved history. Save first "
               "to capture them."))
     vox = load_vox()
-    name, email = author()
+    name = author()
     if args.files_only:
         if not tree:
             die("nothing saved yet — files-only pack needs at least one save")
@@ -4200,7 +5154,7 @@ def cmd_pack(args):
         "sb_version": VERSION,
         "payload": payload_kind,
         "created": int(time.time()),
-        "created_by": {"name": name, "email": email},
+        "created_by": {"name": name},
         "repo_id": repo.meta("repo_id"),
         "repo_name": repo.root.name,
         "branch": repo.current_branch(),
@@ -4223,7 +5177,7 @@ def cmd_pack(args):
     tree_print([
         f"branch   {manifest['branch']} {dim('· anchor')} {amber(manifest['chain_head'][:16])}",
         f"holds    {what}",
-        f"sealed   {name} <{email}>  "
+        f"sealed   {name}  "
         + dim(time.strftime('%Y-%m-%d %H:%M', time.localtime(manifest['created']))),
         dim("encrypted with vox · unpack: sb unpack "
             + out.name + " -k <passkey>"),
@@ -4381,7 +5335,7 @@ def _do_unpack(args, src, manifest, body_path, dest_name):
         held = None
 
     print(f"{bold('unpacked')} {amber(str(dest))} {dim('·')} {dim(str(n) + ' file(s)')}")
-    rows = [f"sealed by  {who.get('name','?')} <{who.get('email','?')}>  {dim('· ' + when)}",
+    rows = [f"sealed by  {who.get('name','?')}  {dim('· ' + when)}",
             f"branch     {manifest.get('branch','main')} "
             + dim("· anchor ") + amber(manifest.get("chain_head","")[:16])]
     if merging:
@@ -4435,7 +5389,7 @@ def cmd_export(args):
     tree = read_tree(repo, c["tree"])
     if not tree:
         die(f"{how} contains no files")
-    name, email = author()
+    name = author()
 
     if args.key is not None:                    # encrypted .sbox export
         key = args.key or _get_key(args, confirm=True)
@@ -4444,7 +5398,7 @@ def cmd_export(args):
             "format": "sbox", "sbox_version": SBOX_VERSION,
             "sb_version": VERSION, "payload": "files",
             "created": int(time.time()),
-            "created_by": {"name": name, "email": email},
+            "created_by": {"name": name},
             "repo_id": repo.meta("repo_id"),
             "repo_name": repo.root.name,
             "branch": repo.current_branch(),
@@ -4712,8 +5666,14 @@ def main(argv=None):
         jp = sub.add_parser("journal")
         jp.add_argument("-n", "--limit", type=int, default=0, metavar="<count>")
         sub.add_parser("info")
-        who = sub.add_parser("who"); who.add_argument("name", nargs="?")
-        who.add_argument("email", nargs="?")
+        sv = sub.add_parser("service")
+        sv.add_argument("-i", "--install", action="store_true")
+        sv.add_argument("-s", "--status", action="store_true")
+        sv.add_argument("-k", "--kill", action="store_true")
+        sv.add_argument("--run", action="store_true", help=argparse.SUPPRESS)
+        ua = sub.add_parser("useradd"); ua.add_argument("user", nargs="?")
+        ud = sub.add_parser("userdel"); ud.add_argument("user", nargs="?")
+        sub.add_parser("users")
         gp = sub.add_parser("ignore"); gp.add_argument("pattern")
         # parse_known_args, so leftovers are blamed on the command that was
         # typed ('sb log: ...') rather than the bare 'sb' parser
