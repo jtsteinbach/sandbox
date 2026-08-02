@@ -642,15 +642,55 @@ def _sudo_user():
         name = os.environ.get("SUDO_USER")
         return (int(uid), -1, name, None) if name else None
 
+def _my_uid():
+    # the account sb's identity belongs to. under sudo that is the invoking
+    # login, not root: the profile resolves that way, so lock ownership has
+    # to resolve the same way or 'sudo sb' files itself under a second,
+    # invented person and locks you out of your own edits
+    su = _sudo_user()
+    if su:
+        return su[0]
+    try:
+        return os.getuid()
+    except AttributeError:          # windows has no usable owner signal
+        return None
+
+def _my_uids():
+    # every OS account whose files are mine. under sudo a file may be owned
+    # by the login account (edited normally) or by root (written while sb
+    # was elevated); both are the one person sitting here
+    out = set()
+    login = _my_uid()
+    if login is not None:
+        out.add(login)
+    try:
+        out.add(os.getuid())
+    except AttributeError:
+        pass
+    return out
+
+def _account_home():
+    # the home directory of the account sb is running as, taken from the
+    # password database rather than $HOME.
+    #
+    # 'su bob' without '-' leaves HOME pointing at the previous user, and a
+    # profile read out of someone else's home files every save, lock and
+    # export under their name. the password database cannot drift that way.
+    uid = _my_uid()
+    if uid is not None:
+        try:
+            import pwd
+            return Path(pwd.getpwuid(uid).pw_dir)
+        except (ImportError, KeyError, OSError):
+            pass
+    return Path.home()
+
 def _config_dir():
-    # where the profile lives: SB_HOME, else the invoking account's home,
-    # else this process's home
+    # where the profile lives: SB_HOME, else the home of the account this
+    # process is actually running as
     if os.environ.get("SB_HOME"):
         return Path(os.environ["SB_HOME"])
-    su = _sudo_user()
-    if su and su[3] is not None:
-        return su[3] / ".config" / "sandbox"
-    return Path.home() / ".config" / "sandbox"
+    return _account_home() / ".config" / "sandbox"
 
 CONFIG_DIR = _config_dir()
 CONFIG_FILE = CONFIG_DIR / "profile.json"
@@ -1418,32 +1458,7 @@ def shared_mode(repo):
     # old journals may still hold 'shared' entries; they are only displayed
     return True
 
-def _my_uid():
-    # the account sb's identity belongs to. under sudo that is the invoking
-    # login, not root: author() and the profile already resolve that way, so
-    # lock ownership has to resolve the same way or 'sudo sb' files itself
-    # under a second, invented person and locks you out of your own edits
-    su = _sudo_user()
-    if su:
-        return su[0]
-    try:
-        return os.getuid()
-    except AttributeError:          # windows has no usable owner signal
-        return None
-
-def _my_uids():
-    # every OS account whose files are mine. under sudo a file may be owned
-    # by the login account (edited normally) or by root (written while sb
-    # was elevated); both are the one person sitting here
-    out = set()
-    login = _my_uid()
-    if login is not None:
-        out.add(login)
-    try:
-        out.add(os.getuid())
-    except AttributeError:
-        pass
-    return out
+# _my_uid / _my_uids live up with the identity code, above CONFIG_DIR
 
 def register_identity(repo):
     # remember which OS account maps to which identity, so edits found on
@@ -1615,11 +1630,35 @@ def release_locks(repo, paths):
             lock_perms_off(repo, rel, locks[rel].get("perm", -1))
     repo.clear_locks(paths)
 
+def lock_is_mine(lock, my_uids=None, my_email=None):
+    # the one place that answers "is this lock mine?".
+    #
+    # the OS account that took the lock is the stable signal. the email is
+    # display metadata: it moves when you run 'sb who', when $HOME points
+    # somewhere else, when a profile is missing, when sb has to invent an
+    # identity for an unregistered account. none of those make your own
+    # edit someone else's work, so none of them may decide this.
+    #
+    # email is consulted only when there is no uid to go on: locks written
+    # by a format older than uid tracking, and platforms with no owner
+    # signal. one login shared by several sb identities also lands here and
+    # resolves in favour of the account, which is how sb already attributes
+    # the writes themselves.
+    if my_uids is None:
+        my_uids = _my_uids()
+    if my_email is None:
+        _, my_email = author()
+    uid = lock.get("uid", -1)
+    if uid is not None and uid >= 0:
+        return uid in my_uids or lock["email"] == my_email
+    return lock["email"] == my_email
+
 def foreign_locks(repo):
     # paths locked by someone else. never overwritten by a checkout, never
     # counted as my unsaved changes, never included in my saves
-    _, email = author()
-    return {p for p, l in repo.locks().items() if l["email"] != email}
+    my_uids, (_, my_email) = _my_uids(), author()
+    return {p for p, l in repo.locks().items()
+            if not lock_is_mine(l, my_uids, my_email)}
 
 def _disk_state(repo, rel):
     # (mode, hash, data, st) for a path. anything but a plain file is absent
@@ -2216,7 +2255,7 @@ def cmd_status(args):
         rows = []
         for p in sorted(locks):
             l = locks[p]
-            mine = l["email"] == email
+            mine = lock_is_mine(l)
             who = bold("you") if mine else l["owner"]
             rows.append(f"{cyan(p)}  " + dim(f"locked by {who} "
                         + _ago(l["since"])
@@ -2343,15 +2382,16 @@ def _save_shared(repo, args):
         disk = snapshot_worktree(repo, write=True)   # what's really on disk
         tree_files, head_c = head_tree_files(repo)
         locks = repo.locks()
-        mine = sorted(p for p, l in locks.items() if l["email"] == email)
+        mine = sorted(p for p, l in locks.items() if lock_is_mine(l))
         # include files I changed that somehow aren't locked
         a, m, d = worktree_vs_tree(disk, tree_files)
         mine = sorted(set(mine) | {p for p in (set(a) | set(m) | set(d))
-                                   if locks.get(p, {}).get("email", email) == email})
+                                   if p not in locks
+                                   or lock_is_mine(locks[p])})
         changed = [p for p in mine if disk.get(p) != tree_files.get(p)]
         if not changed:
             print(green("nothing of yours to save"))
-            held = sorted(p for p, l in locks.items() if l["email"] != email)
+            held = sorted(p for p, l in locks.items() if not lock_is_mine(l))
             if held:
                 leaf(dim(f"{len(held)} file(s) belong to other people's "
                          "locks: " + ", ".join(held[:4])
@@ -2407,7 +2447,7 @@ def _save_shared(repo, args):
           f"{dim(str(len(changed)) + ' of your file(s)')}")
     leaf(f'"{args.message}"  ' + dim("· locks released"))
     _report_redactions(redacted)
-    others = sorted(p for p, l in repo.locks().items() if l["email"] != email)
+    others = sorted(p for p, l in repo.locks().items() if not lock_is_mine(l))
     if others:
         leaf(dim(f"{len(others)} file(s) still locked by others — not included"))
 
@@ -2950,7 +2990,7 @@ def cmd_merge(args):
     touched = {rel for rel in set(theirs_tree_pre) | set(ours_tree_pre)
                if theirs_tree_pre.get(rel) != ours_tree_pre.get(rel)}
     blocked = [(p, l) for p, l in repo.locks().items()
-               if p in touched and l["email"] != email]
+               if p in touched and not lock_is_mine(l)]
     if blocked and not ignore_locked:
         print(red("merge blocked — it would change files locked by others:"))
         tree_print([f"{red(p)}  " + dim(f"locked by {l['owner']} "
@@ -3533,7 +3573,7 @@ def cmd_locks(args):
     rows = []
     for p in sorted(locks):
         l = locks[p]
-        mine = l["email"] == email
+        mine = lock_is_mine(l)
         left = max(0, (l["since"] + LOCK_TTL - int(time.time())) // 60)
         note = (("you" if mine else l["owner"]) + " · " + _ago(l["since"])
                 + f" · expires in {left}m")
@@ -3554,7 +3594,7 @@ def cmd_unlock(args):
     force = getattr(args, "force", False)
     locks = repo.locks()
     targets = list(args.paths) if args.paths else \
-        [p for p, l in locks.items() if force or l["email"] == email]
+        [p for p, l in locks.items() if force or lock_is_mine(l)]
     if not targets:
         print(dim("nothing to unlock" + ("" if force else
                   " (you hold no locks; 'sb unlock <path> --force' releases "
@@ -3565,7 +3605,7 @@ def cmd_unlock(args):
         l = locks.get(p)
         if not l:
             missing.append(p)
-        elif l["email"] == email or force:
+        elif lock_is_mine(l) or force:
             freed.append(p)
         else:
             denied.append(p)
