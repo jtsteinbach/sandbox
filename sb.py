@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# sandbox (sb): version control in a single file.
+# sandbox (sb): optimal version control
 # version 1.3 · jts.gg/sandbox
 
 import sys, os, io, json, time, zlib, hashlib, fnmatch, difflib, re
