@@ -3,9 +3,9 @@
 **Version 1.3** · [jts.gg/sandbox](https://jts.gg/sandbox)
 **License** · [jts.gg/license](https://jts.gg/license)
 
-Version control in one file. No dependencies past Python 3.9, no keys to manage, and no command that destroys saved history.
+Optimized local version control built for Debian Linux. No dependencies beyond Python 3.9
 
-sandbox keeps the two ideas git got right — content addressing and a Merkle DAG of snapshots — and drops the staging area, detached HEADs, destructive commands, and the loose-file repository layout. It adds one thing git has no notion of: it asks the kernel which account wrote each file, and builds sharing, locking, and file access on the answer.
+The whole repository is one SQLite database. Snapshots are content-addressed and parent-linked, but there is no staging area and no detached HEAD — a save is your working folder as it stands. Several people can share that folder, so sandbox asks the kernel which account wrote each file and hangs locking and file access off the answer.
 
 ---
 
@@ -73,7 +73,7 @@ Existing repositories register themselves with the service on the next command.
 
 **Identity is not configuration.** You are your Linux account. The roster of accounts on a repository grants write access; a kernel-backed service records which account performed each write. None of it can disagree with the machine it runs on.
 
-**Narrow security claims.** Integrity, tamper evidence, leak prevention — each with a stated mechanism and stated limits (Section 11). No keys, no signatures. SHA-256 from the standard library, for content addressing and hash chaining.
+**Security claims.** Integrity, tamper evidence, leak prevention — each with a stated mechanism and stated limits (Section 11). No keys, no signatures. SHA-256 from the standard library, for content addressing and hash chaining.
 
 ---
 
@@ -532,7 +532,7 @@ Redaction is a seatbelt, not a policy. The durable fix is an environment variabl
 
 ## 11. Security model
 
-### Integrity — what you get back is what you put in
+### Integrity
 
 Objects are keyed and re-hashed by SHA-256 on every read. Each save embeds its tree and parent hashes, transitively fixing every byte before it. Operations commit as one SQLite transaction (WAL, `synchronous=FULL`). Worktree writes use exclusive randomized temp files, fsync, and atomic rename through no-follow parent descriptors — checkout, switch, merge, restore, `undo -p`, lock reverts, `salvage`. A crash between database and folder surfaces as ordinary unsaved changes.
 
@@ -540,13 +540,13 @@ Covers: corruption, torn and partial writes, power loss, truncated or bit-flippe
 
 Doesn't cover: loss of the database file. Detection is not backup.
 
-### Tamper evidence — changes behind sandbox's back are detectable
+### Tamper evidence
 
 The hash-chained journal, plus `sb verify` recomputing it and cross-checking every branch tip, catches edited or deleted entries, refs moved or injected via direct SQL, and replaced objects.
 
 Limit: anyone with write access and knowledge of the format can rewrite the whole store into a consistent history. With no secret material, consistency is recomputable by anyone — inherent to keyless designs. Anchors (Section 12) close it, since a value recorded off-machine can't be reproduced by any rewrite. What sandbox won't do is ship the appearance of cryptographic authenticity without key management that would make it mean something.
 
-### Leak prevention — credentials don't enter history in the clear
+### Leak prevention
 
 Save-time redaction, on by default, overridable only explicitly, with both the redaction and the override journaled. Unredactable files block instead.
 
