@@ -21,7 +21,7 @@ DB_NAME = "sandbox.db"
 REF_OPS = ("save", "merge", "undo", "restore", "branch", "ref",
            "autosave")
 
-# === output ===
+# ――― output ―――
 # three colors: bold white, dim gray, one amber accent. red means failure
 def _c(code, s):
     return f"\033[{code}m{s}\033[0m" if sys.stdout.isatty() else str(s)
@@ -58,7 +58,7 @@ class TamperedJournal(Exception):
     # The journal hash chain does not verify.
     pass
 
-# === hashing ===
+# ――― hashing ―――
 def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -82,7 +82,7 @@ def hash_file(path, size):
 def hash_obj(kind: str, data: bytes) -> str:
     return sha256_hex(f"{kind} {len(data)}\0".encode() + data)
 
-# === the store ===
+# ――― the store ―――
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -245,7 +245,7 @@ class Repo:
                 self.db.execute("ALTER TABLE locks ADD COLUMN "
                                 "perm INTEGER NOT NULL DEFAULT -1")
 
-    # === meta ===
+    # ――― meta ―――
     def meta(self, key, default=None):
         row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
         return row[0] if row else default
@@ -257,7 +257,7 @@ class Repo:
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (key, str(value)))
 
-    # === object store ===
+    # ――― object store ―――
     # a big file is stored as a list of chunk hashes rather than one blob,
     # so a later version of it only costs the chunks that actually changed
     # and no single read has to hold the whole thing
@@ -438,7 +438,7 @@ class Repo:
                 die(f"'{name_or_prefix}' is ambiguous — give more characters")
         return None
 
-    # === refs / branch pointer ===
+    # ――― refs / branch pointer ―――
     def current_branch(self):
         return self.meta("branch")
 
@@ -483,7 +483,7 @@ class Repo:
             self.journal("branch-remove", {"branch": branch, "old": old or "",
                                            "new": ""})
 
-    # === journal ===
+    # ――― journal ―――
     def chain_head(self):
         row = self.db.execute(
             "SELECT link FROM journal ORDER BY seq DESC LIMIT 1").fetchone()
@@ -533,7 +533,7 @@ class Repo:
             n += 1
         return n, head
 
-    # === stat cache ===
+    # ――― stat cache ―――
     # keyed on size, mtime, ctime, inode. mtime alone can be forged from
     # userspace, so ctime and inode are what catch a same size edit
     def cached_hash(self, rel, size, mtime_ns, ctime_ns, ino):
@@ -554,7 +554,7 @@ class Repo:
                 "mtime=excluded.mtime, ctime=excluded.ctime, "
                 "ino=excluded.ino, hash=excluded.hash", entries)
 
-    # === locks ===
+    # ――― locks ―――
     def locks(self):
         # {path: {owner, since, base, held, mode, uid}}. held is the
         # content being protected, LOCK_DELETED if the holder deleted it, or
@@ -625,7 +625,7 @@ def need_repo() -> Repo:
         register_repo(root)
     return repo
 
-# === identity ===
+# ――― identity ―――
 # a person is an OS account. there is no profile, no configured name, no
 # email: the account that runs sb is who you are, and the account that owns
 # a file is who it belongs to. nothing here can drift out of step with the
@@ -691,7 +691,7 @@ def author():
     # who the current operation is attributed to: my account name
     return uid_name(_my_uid())
 
-# === ignores ===
+# ――― ignores ―――
 DEFAULT_IGNORES = [SB_DIR, "*.sbox", "*.pyc", "__pycache__", ".DS_Store",
     ".git", ".svn", "node_modules", "*.egg-info", ".venv", "venv",
     # editor scratch. these appear and vanish mid-save; tracking them
@@ -718,7 +718,7 @@ def is_ignored(rel: str, pats) -> bool:
             return True
     return False
 
-# === secret scanner ===
+# ――― secret scanner ―――
 # stop credentials entering permanent history. a recognized one in clean
 # UTF-8 text becomes <REDACTED> in the blob being committed, leaving the
 # file on disk alone. a file that cannot be rewritten faithfully blocks
@@ -836,7 +836,7 @@ def _report_hard_blocked(hard_blocked, what="save"):
               "--allow-secrets"))
     sys.exit(2)
 
-# === trees ===
+# ――― trees ―――
 _BAD_NAME = re.compile(r"^\.?\.?$")   # "", ".", ".."
 
 def safe_name(name: str) -> bool:
@@ -980,7 +980,7 @@ def read_tree(repo: Repo, tree_hash: str, prefix="") -> dict:
             out[prefix + name] = (mode, h)
     return out
 
-# === commits ===
+# ――― commits ―――
 def make_commit(repo: Repo, tree_hash, parents, message) -> str:
     name = author()
     c = {"tree": tree_hash, "parents": list(parents), "author": name,
@@ -1163,7 +1163,7 @@ def _similar_renames(repo, new_files, old_files, added, deleted):
         out.append((d, a))
     return sorted(out)
 
-# === checkout / cleanup ===
+# ――― checkout / cleanup ―――
 def _safe_parent_fd(root_fd: int, rel: str):
     # open the parent of rel without following any symlinked component.
     # gives (parent_fd, leaf_name); the caller closes the fd. raises
@@ -1417,7 +1417,7 @@ def _prune_empty_dirs(repo: Repo):
         except OSError:
             pass
 
-# === shared locking ===
+# ――― shared locking ―――
 # a team shares one folder and one database. a lock protects content, not
 # permission:
 #
@@ -1614,7 +1614,7 @@ def release_locks(repo, paths):
             lock_perms_off(repo, rel, locks[rel].get("perm", -1))
     repo.clear_locks(paths)
 
-# === write attribution service ===
+# ――― write attribution service ―――
 # the file system records who *owns* a file, never who *wrote* to it. an
 # in-place write (>>, sed, nano, any editor that truncates) therefore leaves
 # no trace of its author, and ownership alone will attribute it to whoever
@@ -2297,7 +2297,7 @@ def writer_of(root, rel, since=0):
         return None, -1, covered
     return int(row[0]), int(row[1]), covered
 
-# === repo membership ===
+# ――― repo membership ―――
 # a repository has a creator (whoever ran init) and a roster of OS accounts
 # allowed to work in it. membership is what grants write access to an
 # unlocked file; a lock narrows that to one person for as long as it lasts.
@@ -2759,7 +2759,7 @@ def ensure_clean(repo, extra_exempt=None):
             "       (" + ", ".join(dirty[:5])
             + (" …" if len(dirty) > 5 else "") + ")")
 
-# === three way merge ===
+# ――― three way merge ―――
 def _diff_regions(base, side):
     # changed regions of side against base, in base coordinates
     out = []
@@ -2821,7 +2821,7 @@ def merge3(base, ours, theirs):
                 conflicts += 1
                 out.append("<<<<<<< ours")
                 out.extend(a_txt)
-                out.append("=======")
+                out.append("――――――=")
                 out.extend(b_txt)
                 out.append(">>>>>>> theirs")
             pos = e
@@ -2866,7 +2866,7 @@ def text_form(repo, h):
         return None
     return lines, eol, trailing
 
-# === test gates ===
+# ――― test gates ―――
 # scripts in sb-tests/<stage>/ are tracked files, so they travel with
 # branches. the stages gate saves, merges and releases.
 # they run in name order inside a clean temp checkout of the candidate tree,
@@ -2965,7 +2965,7 @@ print("[{name}] checking", os.environ["SB_BRANCH"], "@", os.environ["SB_COMMIT"]
 sys.exit(0)
 """
 
-# === commands ===
+# ――― commands ―――
 def cmd_init(args):
     root = Path(".").resolve()
     if (root / SB_DIR).exists():
@@ -4640,7 +4640,7 @@ def cmd_ignore(args):
     print(f"ignoring {cyan(args.pattern)}")
     leaf(dim(".sbignore updated"))
 
-# === portable archive ===
+# ――― portable archive ―――
 # 'sb pack' seals the database and a small manifest into one encrypted
 # .sbox file, 'sb unpack' reverses it. encryption comes from vox, embedded
 # below, so both work offline
@@ -5469,7 +5469,7 @@ def _share_parser(cmd):
     if cmd == "unpack":
         sp.add_argument("-i", "--ignore", action="store_true")
     return sp
-# === CLI ===
+# ――― CLI ―――
 # one usage line per command, shown when its arguments do not parse
 USAGES = {
     "sb":         "sb <command> [arguments]",
